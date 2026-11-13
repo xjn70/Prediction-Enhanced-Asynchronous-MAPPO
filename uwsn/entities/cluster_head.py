@@ -1,0 +1,166 @@
+"""Cluster head buffering, state reports, and exclusive service leases."""
+
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+
+from .common import (
+    OverflowPolicy,
+    Position3D,
+    _finite_float,
+    _nonnegative_float,
+    _positive_float,
+    _require_int,
+    _validate_position,
+)
+from .data_packet import DataPacket, _remove_packet_batch
+
+
+@dataclass(frozen=True)
+class PacketStamp:
+    """Identity and generation time of a packet at the CH."""
+
+    packet_id: int
+    generation_time_s: float
+
+
+@dataclass(frozen=True)
+class CHReport:
+    """A snapshot of the CH buffer and the optional cumulative packet counter."""
+
+    ch_id: int
+    report_time_s: float
+    buffer_size_bytes: int
+    packet_timestamps: tuple[PacketStamp, ...]
+    total_generated_packets: int | None = None
+
+
+@dataclass(frozen=True)
+class BufferInsertResult:
+    """Outcome of generating a packet, including all packets lost to overflow."""
+
+    inserted: bool
+    dropped_packets: tuple[DataPacket, ...] = ()
+
+
+@dataclass
+class ClusterHead:
+    """A fixed CH with a bounded FIFO buffer and one service lease."""
+
+    ch_id: int
+    position: Position3D
+    buffer_capacity_bytes: int
+    communication_radius_m: float
+    generation_rate_pps: float
+    overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
+    total_generated_packets: int = field(init=False, default=0)
+    total_generated_bytes: int = field(init=False, default=0)
+    service_lock_owner: int | None = field(init=False, default=None)
+    service_lock_expiry_s: float | None = field(init=False, default=None)
+    _buffer: dict[int, DataPacket] = field(init=False, default_factory=dict, repr=False)
+    _buffer_size_bytes: int = field(init=False, default=0, repr=False)
+
+    def __post_init__(self) -> None:
+        _require_int(self.ch_id, "ch_id")
+        self.position = _validate_position(self.position)
+        _require_int(self.buffer_capacity_bytes, "buffer_capacity_bytes")
+        self.communication_radius_m = _positive_float(
+            self.communication_radius_m, "communication_radius_m"
+        )
+        self.generation_rate_pps = _nonnegative_float(self.generation_rate_pps, "generation_rate_pps")
+        self.overflow_policy = OverflowPolicy(self.overflow_policy)
+
+    @property
+    def buffer(self) -> tuple[DataPacket, ...]:
+        """Return a snapshot of buffered packets in FIFO order."""
+        return tuple(self._buffer.values())
+
+    @property
+    def buffer_size_bytes(self) -> int:
+        """Return the current number of bytes stored at the CH."""
+        return self._buffer_size_bytes
+
+    def generate_packet(self, packet: DataPacket) -> BufferInsertResult:
+        """Count a generated packet and apply the configured overflow policy."""
+        if not isinstance(packet, DataPacket):
+            raise ValueError("packet must be a DataPacket")
+        if packet.source_ch_id != self.ch_id:
+            raise ValueError("packet source_ch_id must match this CH")
+        if packet.packet_id in self._buffer:
+            raise ValueError(f"packet_id {packet.packet_id} is already buffered")
+
+        self.total_generated_packets += 1
+        self.total_generated_bytes += packet.size_bytes
+        if packet.size_bytes > self.buffer_capacity_bytes:
+            return BufferInsertResult(False, (packet,))
+
+        free_bytes = self.buffer_capacity_bytes - self._buffer_size_bytes
+        if packet.size_bytes > free_bytes and self.overflow_policy is OverflowPolicy.DROP_NEWEST:
+            return BufferInsertResult(False, (packet,))
+
+        dropped = []
+        while packet.size_bytes > free_bytes:
+            oldest = self._buffer.pop(next(iter(self._buffer)))
+            dropped.append(oldest)
+            free_bytes += oldest.size_bytes
+        self._buffer[packet.packet_id] = packet
+        self._buffer_size_bytes = self.buffer_capacity_bytes - free_bytes + packet.size_bytes
+        return BufferInsertResult(True, tuple(dropped))
+
+    def peek_packets(self, max_bytes: int) -> tuple[DataPacket, ...]:
+        """Return the longest whole-packet FIFO prefix within the byte budget."""
+        _require_int(max_bytes, "max_bytes")
+        packets = []
+        remaining_bytes = max_bytes
+        for packet in self._buffer.values():
+            if packet.size_bytes > remaining_bytes:
+                break
+            packets.append(packet)
+            remaining_bytes -= packet.size_bytes
+        return tuple(packets)
+
+    def remove_packets(self, packet_ids: Iterable[int]) -> tuple[DataPacket, ...]:
+        """Remove the selected packets after validating the entire request."""
+        removed = _remove_packet_batch(self._buffer, packet_ids)
+        self._buffer_size_bytes -= sum(packet.size_bytes for packet in removed)
+        return removed
+
+    def create_report(
+        self, report_time_s: float, include_generation_counter: bool = False
+    ) -> CHReport:
+        """Return a snapshot with the cumulative generation count only on request."""
+        report_time_s = _nonnegative_float(report_time_s, "report_time_s")
+        if not isinstance(include_generation_counter, bool):
+            raise ValueError("include_generation_counter must be a bool")
+        stamps = []
+        for packet in self._buffer.values():
+            if packet.generation_time_s > report_time_s:
+                raise ValueError("report_time_s cannot precede a buffered packet's generation")
+            stamps.append(PacketStamp(packet.packet_id, packet.generation_time_s))
+        counter = self.total_generated_packets if include_generation_counter else None
+        return CHReport(self.ch_id, report_time_s, self.buffer_size_bytes, tuple(stamps), counter)
+
+    def try_acquire_service_lock(
+        self, auv_id: int, now_s: float, lease_duration_s: float
+    ) -> bool:
+        """Acquire a free or expired lease, or renew the caller's lease."""
+        _require_int(auv_id, "auv_id")
+        now_s = _nonnegative_float(now_s, "now_s")
+        lease_duration_s = _positive_float(lease_duration_s, "lease_duration_s")
+        expiry_s = self.service_lock_expiry_s
+        if expiry_s is not None and now_s < expiry_s and self.service_lock_owner != auv_id:
+            return False
+        new_expiry_s = _finite_float(now_s + lease_duration_s, "service_lock_expiry_s")
+        if new_expiry_s <= now_s:
+            raise ValueError("lease_duration_s is too short to advance the clock")
+        self.service_lock_owner = auv_id
+        self.service_lock_expiry_s = new_expiry_s
+        return True
+
+    def release_service_lock(self, auv_id: int) -> bool:
+        """Release the caller's lease and return whether it held the lock."""
+        _require_int(auv_id, "auv_id")
+        if self.service_lock_owner != auv_id:
+            return False
+        self.service_lock_owner = None
+        self.service_lock_expiry_s = None
+        return True
