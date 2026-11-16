@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from ..entities import BufferInsertResult, ClusterHead, DataPacket
 from ..entities.common import _nonnegative_float, _require_int
+from .mmpp_process import GenerationMode, MMPPConfig, MMPPProcess, MMPPStats
 from .poisson_process import PoissonProcess
 from .rate_schedule import RateSchedule
 
@@ -24,10 +25,11 @@ class PacketParameters:
 
 @dataclass(frozen=True)
 class GenerationEvent:
-    """One pending CH generation time, available only to the simulation side."""
+    """One pending generation time with an optional simulation-only hidden mode."""
 
     ch_id: int
     time_s: float
+    mode: GenerationMode | None = None
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ class GenerationStats:
 @dataclass
 class _CHGeneration:
     ch: ClusterHead
-    process: PoissonProcess
+    process: PoissonProcess | MMPPProcess
     packet_parameters: PacketParameters
     initial_generated_packets: int = 0
     initial_generated_bytes: int = 0
@@ -77,7 +79,7 @@ class GenerationManager:
     One pending time per CH is held and scanned in O(number of CHs) time. Equal
     times are ordered by ch_id, independently of registration order.
 
-    The explicit schedule drives the process; the entity's scalar generation_rate_pps
+    The explicit schedule or MMPP config drives the process; the scalar generation_rate_pps
     is left untouched. Generation after initialization should pass through this
     manager so overflow statistics and the CH's generated totals cover the same work.
     IDs are unique across this manager's CHs. For continuing an existing mission,
@@ -108,6 +110,19 @@ class GenerationManager:
         seed: int,
     ) -> None:
         """Register an entity with its own schedule, packet parameters and RNG seed."""
+        self._validate_registration(ch, packet_parameters)
+        process = PoissonProcess(schedule, self.mission_deadline_s, seed, self.start_time_s)
+        self._registrations[ch.ch_id] = _CHGeneration(ch, process, packet_parameters)
+
+    def register_mmpp_ch(
+        self, ch: ClusterHead, config: MMPPConfig, packet_parameters: PacketParameters
+    ) -> None:
+        """Register a CH's MMPP with the independent seed stored in config."""
+        self._validate_registration(ch, packet_parameters)
+        process = MMPPProcess(config, self.mission_deadline_s, self.start_time_s)
+        self._registrations[ch.ch_id] = _CHGeneration(ch, process, packet_parameters)
+
+    def _validate_registration(self, ch: ClusterHead, packet_parameters: PacketParameters) -> None:
         if self._initialized:
             raise RuntimeError("register CHs before initializing generation")
         if not isinstance(ch, ClusterHead):
@@ -116,8 +131,21 @@ class GenerationManager:
             raise ValueError(f"CH {ch.ch_id} is already registered")
         if not isinstance(packet_parameters, PacketParameters):
             raise ValueError("packet_parameters must be PacketParameters")
-        process = PoissonProcess(schedule, self.mission_deadline_s, seed, self.start_time_s)
-        self._registrations[ch.ch_id] = _CHGeneration(ch, process, packet_parameters)
+
+    def _sample_pending_event(self, ch_id: int, registration: _CHGeneration) -> None:
+        process = registration.process
+        registration.pending_event = None
+        if isinstance(process, MMPPProcess):
+            event = process.peek_next_event()
+            if event is None:
+                # Commit the final no-packet tail so full-run mode durations are complete.
+                process.next_event()
+            else:
+                registration.pending_event = GenerationEvent(ch_id, event.time_s, event.mode)
+        else:
+            time_s = process.next_time_s()
+            if time_s is not None:
+                registration.pending_event = GenerationEvent(ch_id, time_s)
 
     def initialize(self) -> None:
         """Sample each CH's first event and remember its existing generation counters.
@@ -138,9 +166,7 @@ class GenerationManager:
         for ch_id, registration in self._registrations.items():
             registration.initial_generated_packets = registration.ch.total_generated_packets
             registration.initial_generated_bytes = registration.ch.total_generated_bytes
-            time_s = registration.process.next_time_s()
-            if time_s is not None:
-                registration.pending_event = GenerationEvent(ch_id, time_s)
+            self._sample_pending_event(ch_id, registration)
         self._initialized = True
 
     def peek_next_event(self) -> GenerationEvent | None:
@@ -175,6 +201,8 @@ class GenerationManager:
             decay_rate_per_s=parameters.decay_rate_per_s,
         )
         result = registration.ch.generate_packet(packet)
+        if isinstance(registration.process, MMPPProcess):
+            registration.process.next_event()
         self._next_packet_id += 1
         registration.inserted_packets += int(result.inserted)
         if packet.size_bytes > registration.ch.buffer_capacity_bytes:
@@ -182,11 +210,25 @@ class GenerationManager:
         else:
             registration.overflow_dropped_packets += len(result.dropped_packets)
 
-        next_time_s = registration.process.next_time_s()
-        registration.pending_event = None
-        if next_time_s is not None:
-            registration.pending_event = GenerationEvent(event.ch_id, next_time_s)
+        self._sample_pending_event(event.ch_id, registration)
         return GenerationResult(packet, result)
+
+    def get_mode_stats(self, ch_id: int) -> MMPPStats:
+        """Return simulation-only MMPP diagnostics with their accounting time.
+
+        Counts cover processed generation events. Durations cover through the
+        last processed event, or through the deadline once a stream is exhausted.
+        These snapshots must not be used as AUV observations or predictor inputs.
+        """
+        if not self._initialized:
+            raise RuntimeError("initialize generation before querying statistics")
+        _require_int(ch_id, "ch_id")
+        if ch_id not in self._registrations:
+            raise KeyError(f"CH {ch_id} is not registered")
+        process = self._registrations[ch_id].process
+        if not isinstance(process, MMPPProcess):
+            raise ValueError(f"CH {ch_id} uses Poisson generation and has no MMPP mode statistics")
+        return process.get_stats()
 
     def get_stats(self, ch_id: int) -> GenerationStats:
         """Return generated counter differences and insertion/drop counts for a CH."""
