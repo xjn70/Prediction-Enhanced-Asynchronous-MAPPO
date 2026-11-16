@@ -23,7 +23,7 @@ def main() -> None:
     policies = (OverflowPolicy.DROP_OLDEST, OverflowPolicy.DROP_NEWEST, OverflowPolicy.DROP_OLDEST)
     heads = []
     for ch_id, (config, capacity, policy) in enumerate(zip(configs, capacities, policies)):
-        ch = ClusterHead(ch_id, (100.0 * ch_id, 0.0, -20.0), capacity, 30.0, config.lambda_normal_pps, policy)
+        ch = ClusterHead(ch_id, (100.0 * ch_id, 0.0, -20.0), capacity, 30.0, overflow_policy=policy)
         manager.register_mmpp_ch(ch, config, PacketParameters(1000, 10.0, 0.01))
         heads.append(ch)
 

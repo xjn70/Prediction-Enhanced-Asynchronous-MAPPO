@@ -12,7 +12,6 @@ from uwsn.entities import (
     ClusterHead,
     DataPacket,
     OverflowPolicy,
-    PacketStamp,
     Sink,
 )
 
@@ -24,18 +23,44 @@ def packet(
 
 
 def cluster_head(overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST) -> ClusterHead:
-    return ClusterHead(0, (1.0, 2.0, -3.0), 10, 25.0, 0.5, overflow_policy)
+    return ClusterHead(0, (1.0, 2.0, -3.0), 10, 25.0, overflow_policy=overflow_policy)
 
 
 def test_packet_value_decays_from_generation_until_delivery():
     sample = packet(1, generation_time_s=2.0)
 
     assert sample.voi_at_delivery(2.0, 8.0) == 10.0
-    assert sample.voi_at_delivery(8.0, 8.0) == pytest.approx(10.0 * exp(-0.6))
+    assert sample.voi_at_delivery(8.0, 8.0) == pytest.approx(10.0 * (0.3 + 0.7 * exp(-0.6)))
+    assert sample.voi_at_delivery(1_000_000, 1_000_000) == pytest.approx(3.0)
 
 
 def test_packet_value_is_zero_after_deadline():
     assert packet(1).voi_at_delivery(10.1, 10.0) == 0.0
+
+
+@pytest.mark.parametrize("volume_weight,expected", [
+    (0.0, 10 * exp(-0.1)),
+    (0.3, 10 * (0.3 + 0.7 * exp(-0.1))),
+    (1.0, 10.0),
+])
+def test_sink_delivery_records_apply_configured_voi_weight(volume_weight, expected):
+    sink = Sink((0, 0, 0), 4, volume_weight=volume_weight)
+    sink.enqueue_upload(1, [packet(1), packet(2)], 0)
+    sink.start_next_upload(0)
+
+    on_time = sink.record_packet_delivery(1, 1, 1)
+    late = sink.record_packet_delivery(2, 2, 1)
+    assert on_time.voi == pytest.approx(expected)
+    assert late.voi == 0.0
+    assert sink.total_voi == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("invalid_weight", [-0.1, 1.1, float("nan")])
+def test_value_weight_must_be_a_probability(invalid_weight):
+    with pytest.raises(ValueError, match="volume_weight"):
+        Sink((0, 0, 0), 4, volume_weight=invalid_weight)
+    with pytest.raises(ValueError, match="volume_weight"):
+        packet(1).voi_at_delivery(1, 1, volume_weight=invalid_weight)
 
 
 def test_packet_is_immutable_and_rejects_delivery_before_generation():
@@ -154,9 +179,10 @@ def test_ch_report_snapshots_buffer_and_only_includes_counter_on_request():
     assert report.ch_id == ch.ch_id
     assert report.report_time_s == 5.0
     assert report.buffer_size_bytes == 10
-    assert report.packet_timestamps == (PacketStamp(1, 2.0), PacketStamp(2, 3.0))
+    assert report.packet_timestamps == (2.0, 3.0)
     assert report.total_generated_packets is None
     assert not hasattr(report, "generation_rate_pps")
+    assert not hasattr(ch, "generation_rate_pps")
     assert ch.create_report(5.0, include_generation_counter=True).total_generated_packets == 3
 
     ch.remove_packets([1])
@@ -354,7 +380,7 @@ def test_entity_configuration_and_upload_time_are_validated():
     with pytest.raises(ValueError, match="speed_mps"):
         AUV(1, (0.0, 0.0, 0.0), -1.0, 10)
     with pytest.raises(ValueError, match="buffer_capacity_bytes"):
-        ClusterHead(0, (0.0, 0.0, 0.0), -1, 25.0, 0.5)
+        ClusterHead(0, (0.0, 0.0, 0.0), -1, 25.0)
 
     sink = Sink((0.0, 0.0, 0.0), 4.0)
     with pytest.raises(ValueError, match="at least one packet"):

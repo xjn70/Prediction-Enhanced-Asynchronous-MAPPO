@@ -13,7 +13,7 @@ from .common import (
     _require_int,
     _validate_position,
 )
-from .data_packet import DataPacket, _packet_batch
+from .data_packet import DEFAULT_VOLUME_WEIGHT, DataPacket, _packet_batch, _validate_volume_weight
 
 
 @dataclass(frozen=True)
@@ -73,6 +73,7 @@ class Sink:
 
     position: Position3D
     upload_rate_bytes_per_s: float
+    volume_weight: float = DEFAULT_VOLUME_WEIGHT
     _waiting_queue: list[UploadRequest] = field(init=False, default_factory=list, repr=False)
     _active_upload: UploadJob | None = field(init=False, default=None)
     _delivered_records: list[DeliveryRecord] = field(init=False, default_factory=list, repr=False)
@@ -86,6 +87,7 @@ class Sink:
         self.upload_rate_bytes_per_s = _positive_float(
             self.upload_rate_bytes_per_s, "upload_rate_bytes_per_s"
         )
+        self.volume_weight = _validate_volume_weight(self.volume_weight)
 
     @property
     def waiting_queue(self) -> tuple[UploadRequest, ...]:
@@ -198,7 +200,9 @@ class Sink:
         ):
             raise ValueError(f"delivery_time_s must match scheduled time {expected_time_s}")
         # Use the scheduled time for the deadline test even if the caller rounded it.
-        voi = completion.packet.voi_at_delivery(expected_time_s, mission_deadline_s)
+        voi = completion.packet.voi_at_delivery(
+            expected_time_s, mission_deadline_s, volume_weight=self.volume_weight
+        )
         record = DeliveryRecord(job.request.auv_id, completion.packet, expected_time_s, voi)
         self._delivered_records.append(record)
         self._delivered_packet_ids.add(packet_id)

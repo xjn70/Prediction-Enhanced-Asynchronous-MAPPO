@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prediction-enhanced-async-mappo-uwsn"
+version = "0.1.0"
+description = "UWSN entities and CH data generation for Prediction-Enhanced Asynchronous MAPPO"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["uwsn", "uwsn.*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
