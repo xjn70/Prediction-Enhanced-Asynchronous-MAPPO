@@ -79,9 +79,9 @@ class GenerationManager:
     One pending time per CH is held and scanned in O(number of CHs) time. Equal
     times are ordered by ch_id, independently of registration order.
 
-    The explicit schedule or MMPP config drives the process; the scalar generation_rate_pps
-    is left untouched. Generation after initialization should pass through this
-    manager so overflow statistics and the CH's generated totals cover the same work.
+    The explicit schedule or MMPP config provides the true rate. Generate through
+    this manager after initialization so overflow statistics cover the same work
+    as the CH's generated totals.
     IDs are unique across this manager's CHs. For continuing an existing mission,
     first_packet_id must exceed IDs previously used outside the registered buffers.
     """
@@ -92,6 +92,7 @@ class GenerationManager:
     _registrations: dict[int, _CHGeneration] = field(init=False, default_factory=dict, repr=False)
     _initialized: bool = field(init=False, default=False, repr=False)
     _next_packet_id: int = field(init=False, repr=False)
+    _clock_s: float | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.start_time_s = _nonnegative_float(self.start_time_s, "start_time_s")
@@ -120,6 +121,12 @@ class GenerationManager:
         """Register a CH's MMPP with the independent seed stored in config."""
         self._validate_registration(ch, packet_parameters)
         process = MMPPProcess(config, self.mission_deadline_s, self.start_time_s)
+        if any(
+            isinstance(registration.process, MMPPProcess)
+            and registration.process.config.random_seed == config.random_seed
+            for registration in self._registrations.values()
+        ):
+            raise ValueError("each registered MMPP CH must have a distinct random_seed")
         self._registrations[ch.ch_id] = _CHGeneration(ch, process, packet_parameters)
 
     def _validate_registration(self, ch: ClusterHead, packet_parameters: PacketParameters) -> None:
@@ -137,21 +144,28 @@ class GenerationManager:
         registration.pending_event = None
         if isinstance(process, MMPPProcess):
             event = process.peek_next_event()
-            if event is None:
-                # Commit the final no-packet tail so full-run mode durations are complete.
+            if event is None and self._clock_s is None:
+                # Standalone runs have no external clock to commit the tail.
                 process.next_event()
-            else:
+            elif event is not None:
                 registration.pending_event = GenerationEvent(ch_id, event.time_s, event.mode)
         else:
             time_s = process.next_time_s()
             if time_s is not None:
                 registration.pending_event = GenerationEvent(ch_id, time_s)
 
-    def initialize(self) -> None:
+    @property
+    def registered_cluster_heads(self) -> tuple[ClusterHead, ...]:
+        """Return the CH entities that receive packets from this manager."""
+        return tuple(registration.ch for registration in self._registrations.values())
+
+    def initialize(self, *, synchronize_clock: bool = False) -> None:
         """Sample each CH's first event and remember its existing generation counters.
 
         Existing buffered IDs are checked and skipped by the shared ID allocator.
         Reinitialization is rejected to prevent replaying events into existing state.
+        A simulator enables clock synchronization and calls advance_to before
+        processing events or exposing time-aligned diagnostics.
         """
         if self._initialized:
             raise RuntimeError("generation is already initialized; use a new manager for a new run")
@@ -162,6 +176,8 @@ class GenerationManager:
                     raise ValueError("registered CH buffers contain duplicate global packet IDs")
                 existing_ids.add(packet.packet_id)
         self._next_packet_id = max(self.first_packet_id, max(existing_ids, default=-1) + 1)
+        if synchronize_clock:
+            self._clock_s = self.start_time_s
 
         for ch_id, registration in self._registrations.items():
             registration.initial_generated_packets = registration.ch.total_generated_packets
@@ -180,6 +196,24 @@ class GenerationManager:
         )
         return min(events, key=lambda event: (event.time_s, event.ch_id), default=None)
 
+    def advance_to(self, time_s: float) -> None:
+        """Move the diagnostic clock without consuming a pending generation event."""
+        if not self._initialized or self._clock_s is None:
+            raise RuntimeError("initialize generation with clock synchronization first")
+        time_s = _nonnegative_float(time_s, "time_s")
+        if not self._clock_s <= time_s <= self.mission_deadline_s:
+            raise ValueError("time_s must be between the current time and mission deadline")
+        if time_s == self._clock_s:
+            return
+        event = self.peek_next_event()
+        if event is not None and event.time_s < time_s:
+            raise ValueError("cannot advance past a pending generation event")
+        self._clock_s = time_s
+        if time_s == self.mission_deadline_s:
+            for registration in self._registrations.values():
+                if isinstance(registration.process, MMPPProcess):
+                    registration.process.next_event()
+
     def process_event(self, event: GenerationEvent) -> GenerationResult:
         """Generate the next pending event's packet and return its insertion outcome.
 
@@ -190,6 +224,8 @@ class GenerationManager:
             raise ValueError("event must be a GenerationEvent")
         if event != self.peek_next_event():
             raise ValueError("event must match the next pending generation event")
+        if self._clock_s is not None and event.time_s != self._clock_s:
+            raise ValueError("event time must match the generation clock")
         registration = self._registrations[event.ch_id]
         parameters = registration.packet_parameters
         packet = DataPacket(
@@ -217,7 +253,8 @@ class GenerationManager:
         """Return simulation-only MMPP diagnostics with their accounting time.
 
         Counts cover processed generation events. Durations cover through the
-        last processed event, or through the deadline once a stream is exhausted.
+        simulation clock when synchronized. In standalone runs, durations cover
+        through the last processed event or the deadline of an exhausted stream.
         These snapshots must not be used as AUV observations or predictor inputs.
         """
         if not self._initialized:
@@ -228,6 +265,8 @@ class GenerationManager:
         process = self._registrations[ch_id].process
         if not isinstance(process, MMPPProcess):
             raise ValueError(f"CH {ch_id} uses Poisson generation and has no MMPP mode statistics")
+        if self._clock_s is not None:
+            return process.stats_at(self._clock_s)
         return process.get_stats()
 
     def get_stats(self, ch_id: int) -> GenerationStats:

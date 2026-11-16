@@ -6,6 +6,15 @@ from math import exp
 
 from .common import _nonnegative_float, _require_int
 
+DEFAULT_VOLUME_WEIGHT = 0.3
+
+
+def _validate_volume_weight(volume_weight: float) -> float:
+    volume_weight = _nonnegative_float(volume_weight, "volume_weight")
+    if volume_weight > 1:
+        raise ValueError("volume_weight must be at most 1")
+    return volume_weight
+
 
 @dataclass(frozen=True)
 class DataPacket:
@@ -25,16 +34,24 @@ class DataPacket:
         for name in ("generation_time_s", "base_value", "decay_rate_per_s"):
             object.__setattr__(self, name, _nonnegative_float(getattr(self, name), name))
 
-    def voi_at_delivery(self, delivery_time_s: float, mission_deadline_s: float) -> float:
-        """Return the packet value at delivery, including at the exact deadline."""
+    def voi_at_delivery(
+        self,
+        delivery_time_s: float,
+        mission_deadline_s: float,
+        *,
+        volume_weight: float = DEFAULT_VOLUME_WEIGHT,
+    ) -> float:
+        """Return delivered packet value using a fixed amount term and a decaying term."""
         delivery_time_s = _nonnegative_float(delivery_time_s, "delivery_time_s")
         mission_deadline_s = _nonnegative_float(mission_deadline_s, "mission_deadline_s")
+        volume_weight = _validate_volume_weight(volume_weight)
         if delivery_time_s < self.generation_time_s:
             raise ValueError("delivery_time_s cannot precede generation_time_s")
         if delivery_time_s > mission_deadline_s:
             return 0.0
         age_s = delivery_time_s - self.generation_time_s
-        return self.base_value * exp(-self.decay_rate_per_s * age_s)
+        freshness = exp(-self.decay_rate_per_s * age_s)
+        return self.base_value * (volume_weight + (1.0 - volume_weight) * freshness)
 
 
 def _packet_batch(packets: Iterable[DataPacket]) -> tuple[DataPacket, ...]:

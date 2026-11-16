@@ -30,7 +30,6 @@ def main() -> None:
             position=(ch_id * 100.0, 0.0, -20.0),
             buffer_capacity_bytes=20_000,
             communication_radius_m=30.0,
-            generation_rate_pps=schedule.rate_at(0.0),
             overflow_policy=policy,
         )
         manager.register_ch(ch, schedule, PacketParameters(1_000, 10.0, 0.01), seed=100 + ch_id)

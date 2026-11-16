@@ -16,21 +16,13 @@ from .data_packet import DataPacket, _remove_packet_batch
 
 
 @dataclass(frozen=True)
-class PacketStamp:
-    """Identity and generation time of a packet at the CH."""
-
-    packet_id: int
-    generation_time_s: float
-
-
-@dataclass(frozen=True)
 class CHReport:
-    """A snapshot of the CH buffer and the optional cumulative packet counter."""
+    """Local cache volume and generation times, with an opt-in local counter."""
 
     ch_id: int
     report_time_s: float
     buffer_size_bytes: int
-    packet_timestamps: tuple[PacketStamp, ...]
+    packet_timestamps: tuple[float, ...]
     total_generated_packets: int | None = None
 
 
@@ -50,7 +42,6 @@ class ClusterHead:
     position: Position3D
     buffer_capacity_bytes: int
     communication_radius_m: float
-    generation_rate_pps: float
     overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
     total_generated_packets: int = field(init=False, default=0)
     total_generated_bytes: int = field(init=False, default=0)
@@ -58,6 +49,7 @@ class ClusterHead:
     service_lock_expiry_s: float | None = field(init=False, default=None)
     _buffer: dict[int, DataPacket] = field(init=False, default_factory=dict, repr=False)
     _buffer_size_bytes: int = field(init=False, default=0, repr=False)
+    _latest_generation_time_s: float = field(init=False, default=0.0, repr=False)
 
     def __post_init__(self) -> None:
         _require_int(self.ch_id, "ch_id")
@@ -66,7 +58,6 @@ class ClusterHead:
         self.communication_radius_m = _positive_float(
             self.communication_radius_m, "communication_radius_m"
         )
-        self.generation_rate_pps = _nonnegative_float(self.generation_rate_pps, "generation_rate_pps")
         self.overflow_policy = OverflowPolicy(self.overflow_policy)
 
     @property
@@ -90,6 +81,7 @@ class ClusterHead:
 
         self.total_generated_packets += 1
         self.total_generated_bytes += packet.size_bytes
+        self._latest_generation_time_s = max(self._latest_generation_time_s, packet.generation_time_s)
         if packet.size_bytes > self.buffer_capacity_bytes:
             return BufferInsertResult(False, (packet,))
 
@@ -131,13 +123,11 @@ class ClusterHead:
         report_time_s = _nonnegative_float(report_time_s, "report_time_s")
         if not isinstance(include_generation_counter, bool):
             raise ValueError("include_generation_counter must be a bool")
-        stamps = []
-        for packet in self._buffer.values():
-            if packet.generation_time_s > report_time_s:
-                raise ValueError("report_time_s cannot precede a buffered packet's generation")
-            stamps.append(PacketStamp(packet.packet_id, packet.generation_time_s))
+        if report_time_s < self._latest_generation_time_s:
+            raise ValueError("report_time_s cannot precede the latest packet generation")
+        stamps = tuple(packet.generation_time_s for packet in self._buffer.values())
         counter = self.total_generated_packets if include_generation_counter else None
-        return CHReport(self.ch_id, report_time_s, self.buffer_size_bytes, tuple(stamps), counter)
+        return CHReport(self.ch_id, report_time_s, self.buffer_size_bytes, stamps, counter)
 
     def try_acquire_service_lock(
         self, auv_id: int, now_s: float, lease_duration_s: float

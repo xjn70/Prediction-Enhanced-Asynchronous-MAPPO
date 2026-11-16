@@ -27,11 +27,11 @@ def drain(process: MMPPProcess) -> list[MMPPEvent]:
 
 
 def make_ch(ch_id: int, capacity_bytes: int = 10_000) -> ClusterHead:
-    return ClusterHead(ch_id, (0.0, 0.0, -10.0), capacity_bytes, 20.0, 0.0)
+    return ClusterHead(ch_id, (0.0, 0.0, -10.0), capacity_bytes, 20.0)
 
 
 def test_seed_reproduces_packet_times_modes_and_diagnostics():
-    config = MMPPConfig(0.4, 4.0, 0.12, 0.28, GenerationMode.STATIONARY, 21)
+    config = MMPPConfig(0.4, 4.0, 0.12, 0.28, GenerationMode.STATIONARY, random_seed=21)
     first, second = MMPPProcess(config, 100), MMPPProcess(config, 100)
     events = drain(first)
 
@@ -40,8 +40,30 @@ def test_seed_reproduces_packet_times_modes_and_diagnostics():
     assert events != drain(MMPPProcess(replace(config, random_seed=22), 100))
 
 
+def test_mmpp_requires_explicit_distinct_seeds_for_registered_chs():
+    rates = (1, 2, 0.1, 0.2)
+    with pytest.raises(TypeError, match="random_seed"):
+        MMPPConfig(*rates)
+
+    manager = GenerationManager(100)
+    config = MMPPConfig(*rates, random_seed=0)
+    parameters = PacketParameters(4, 1, 0)
+    other = make_ch(1)
+    manager.register_mmpp_ch(make_ch(0), config, parameters)
+    with pytest.raises(ValueError, match="distinct random_seed"):
+        manager.register_mmpp_ch(other, config, parameters)
+    manager.register_mmpp_ch(other, replace(config, random_seed=1), parameters)
+    manager.initialize()
+
+    first_times = {}
+    while len(first_times) < 2 and (event := manager.peek_next_event()) is not None:
+        manager.process_event(event)
+        first_times.setdefault(event.ch_id, event.time_s)
+    assert first_times[0] != first_times[1]
+
+
 def test_competing_clocks_keep_mode_on_arrival_and_switch_in_both_directions():
-    process = MMPPProcess(MMPPConfig(0.4, 6.0, 0.1, 0.25), 6)
+    process = MMPPProcess(MMPPConfig(0.4, 6.0, 0.1, 0.25, random_seed=0), 6)
     # NORMAL switches at 2, BURST emits at 2.5, switches at 3.25, NORMAL emits at 3.75.
     waits = [4, 2, 0.5, 2, 4, 0.75, 0.5, 8, 99, 99]
     with patch.object(process._rng, "expovariate", side_effect=waits) as draw:
@@ -56,7 +78,7 @@ def test_competing_clocks_keep_mode_on_arrival_and_switch_in_both_directions():
 
 
 def test_peek_caches_waits_and_defers_statistics_including_final_tail():
-    process = MMPPProcess(MMPPConfig(0, 2, 1, 1), 10)
+    process = MMPPProcess(MMPPConfig(0, 2, 1, 1, random_seed=0), 10)
     with patch.object(process._rng, "expovariate", side_effect=[2, 1, 6, 10, 10]) as draw:
         initial_stats = process.get_stats()
         event = process.peek_next_event()
@@ -86,7 +108,7 @@ def test_peek_caches_waits_and_defers_statistics_including_final_tail():
     (GenerationMode.NORMAL, 0, 0), (GenerationMode.BURST, 0, 0),
 ])
 def test_explicit_initial_modes_with_zero_outgoing_rate(mode, q01, q10):
-    process = MMPPProcess(MMPPConfig(1, 2, q01, q10, mode, 8), 20)
+    process = MMPPProcess(MMPPConfig(1, 2, q01, q10, mode, random_seed=8), 20)
     assert process.current_mode is mode
 
     events = drain(process)
@@ -98,7 +120,7 @@ def test_explicit_initial_modes_with_zero_outgoing_rate(mode, q01, q10):
 
 
 def test_stationary_initialization_probability_across_independent_seeds():
-    config = MMPPConfig(1, 4, 0.12, 0.28, GenerationMode.STATIONARY)
+    config = MMPPConfig(1, 4, 0.12, 0.28, GenerationMode.STATIONARY, random_seed=0)
     assert config.stationary_probabilities() == pytest.approx((0.7, 0.3))
     initial_modes = [
         MMPPProcess(replace(config, random_seed=seed), 1).current_mode for seed in range(1000)
@@ -111,17 +133,17 @@ def test_stationary_initialization_probability_across_independent_seeds():
     (0, 0.2, GenerationMode.NORMAL), (0.2, 0, GenerationMode.BURST),
 ])
 def test_stationary_initialization_selects_the_absorbing_mode(q01, q10, mode):
-    config = MMPPConfig(0, 0, q01, q10, GenerationMode.STATIONARY)
+    config = MMPPConfig(0, 0, q01, q10, GenerationMode.STATIONARY, random_seed=0)
     assert MMPPProcess(config, 1).current_mode is mode
 
 
 def test_stationary_initialization_requires_a_positive_transition_rate():
     with pytest.raises(ValueError, match="specify NORMAL or BURST"):
-        MMPPConfig(1, 4, 0, 0, GenerationMode.STATIONARY)
+        MMPPConfig(1, 4, 0, 0, GenerationMode.STATIONARY, random_seed=0)
 
 
 def test_zero_arrival_rates_still_account_for_all_mode_switches():
-    process = MMPPProcess(MMPPConfig(0, 0, 2, 3), 8, start_time_s=3)
+    process = MMPPProcess(MMPPConfig(0, 0, 2, 3, random_seed=0), 8, start_time_s=3)
     with patch.object(process._rng, "expovariate", side_effect=[1, 2, 2]) as draw:
         assert process.next_event() is None
         assert [call.args[0] for call in draw.call_args_list] == [2, 3, 2]
@@ -132,7 +154,10 @@ def test_zero_arrival_rates_still_account_for_all_mode_switches():
 @pytest.mark.parametrize("mode", [GenerationMode.NORMAL, GenerationMode.BURST])
 def test_zero_rate_mode_can_switch_to_an_emitting_mode(mode):
     normal_is_silent = mode is GenerationMode.NORMAL
-    config = MMPPConfig(0, 2, 1, 0, mode) if normal_is_silent else MMPPConfig(2, 0, 0, 1, mode)
+    if normal_is_silent:
+        config = MMPPConfig(0, 2, 1, 0, mode, random_seed=0)
+    else:
+        config = MMPPConfig(2, 0, 0, 1, mode, random_seed=0)
     process = MMPPProcess(config, 10)
     with patch.object(process._rng, "expovariate", side_effect=[1, 0.5, 20]):
         events = drain(process)
@@ -141,7 +166,7 @@ def test_zero_rate_mode_can_switch_to_an_emitting_mode(mode):
 
 
 def test_packet_times_are_strictly_increasing_and_exclude_deadline():
-    process = MMPPProcess(MMPPConfig(2, 0, 0, 0), end_time_s=10, start_time_s=4)
+    process = MMPPProcess(MMPPConfig(2, 0, 0, 0, random_seed=0), end_time_s=10, start_time_s=4)
     with patch.object(process._rng, "expovariate", side_effect=[1, 2, 3]):
         assert process.next_time_s() == 5
         assert process.next_time_s() == 7
@@ -156,13 +181,13 @@ def test_packet_times_are_strictly_increasing_and_exclude_deadline():
 ])
 def test_invalid_config_is_rejected(name, value):
     with pytest.raises(ValueError):
-        replace(MMPPConfig(1, 2, 0.1, 0.2), **{name: value})
+        replace(MMPPConfig(1, 2, 0.1, 0.2, random_seed=0), **{name: value})
 
 
 def test_stationary_long_run_occupancy_arrival_rate_and_transition_trend():
     duration_s = 400
     runs = 64
-    config = MMPPConfig(0.4, 4.0, 0.12, 0.28, GenerationMode.STATIONARY)
+    config = MMPPConfig(0.4, 4.0, 0.12, 0.28, GenerationMode.STATIONARY, random_seed=0)
     summaries = []
     for multiplier in (1, 2):
         stats_by_run = []
@@ -248,7 +273,7 @@ def test_mixed_manager_uses_global_ids_and_keeps_hidden_modes_out_of_entities():
         "ch_id", "report_time_s", "buffer_size_bytes", "packet_timestamps", "total_generated_packets",
     }
     assert report["total_generated_packets"] is None
-    assert all(set(stamp) == {"packet_id", "generation_time_s"} for stamp in report["packet_timestamps"])
+    assert report["packet_timestamps"] == tuple(p.generation_time_s for p in heads[1].buffer)
     with pytest.raises(ValueError, match="no MMPP mode statistics"):
         manager.get_mode_stats(0)
 
@@ -288,7 +313,7 @@ def test_tied_poisson_and_mmpp_events_use_ch_id_order():
 @pytest.mark.parametrize("capacity,oversize", [(0, True), (4, False)])
 def test_mode_counts_include_oversized_and_overflow_rejections(capacity, oversize):
     manager = GenerationManager(10)
-    ch = ClusterHead(0, (0, 0, -10), capacity, 20, 0, OverflowPolicy.DROP_NEWEST)
+    ch = ClusterHead(0, (0, 0, -10), capacity, 20, overflow_policy=OverflowPolicy.DROP_NEWEST)
     manager.register_mmpp_ch(ch, MMPPConfig(2, 0, 0, 0, random_seed=1), PacketParameters(4, 1, 0))
     manager.initialize()
     while (event := manager.peek_next_event()) is not None:

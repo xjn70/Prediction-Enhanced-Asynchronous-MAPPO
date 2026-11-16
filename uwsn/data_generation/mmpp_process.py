@@ -1,6 +1,7 @@
 """Exact continuous-time two-state MMPP sampling with cached lookahead."""
 
-from dataclasses import dataclass, field
+from bisect import bisect_right
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from math import inf, nextafter
 from random import Random
@@ -22,6 +23,7 @@ class MMPPConfig:
 
     STATIONARY is used only to choose the initial physical mode. Explicit
     NORMAL or BURST is required when both transition rates are zero.
+    Pass random_seed explicitly for each CH.
     """
 
     lambda_normal_pps: float
@@ -29,7 +31,7 @@ class MMPPConfig:
     q_normal_to_burst_per_s: float
     q_burst_to_normal_per_s: float
     initial_mode: GenerationMode = GenerationMode.NORMAL
-    random_seed: int = 0
+    random_seed: int = field(kw_only=True)
 
     def __post_init__(self) -> None:
         for name in (
@@ -82,6 +84,7 @@ class _PendingOutcome:
     event: MMPPEvent | None
     mode: GenerationMode
     stats: MMPPStats
+    switches: tuple[MMPPStats, ...]
 
 
 @dataclass
@@ -125,6 +128,30 @@ class MMPPProcess:
     def get_stats(self) -> MMPPStats:
         """Return an immutable diagnostic snapshot, excluding an unconsumed packet."""
         return self._stats
+
+    def stats_at(self, time_s: float) -> MMPPStats:
+        """Project diagnostics within the cached interval without consuming it.
+
+        Switches through time_s are counted. A pending packet at time_s is
+        counted only when consumed. The projection keeps sampling independent
+        of how often the simulation clock or diagnostics are updated.
+        """
+        time_s = _nonnegative_float(time_s, "time_s")
+        if time_s == self._stats.accounted_until_s:
+            return self._stats
+        pending = self._pending
+        if pending is None or not self._stats.accounted_until_s < time_s <= pending.stats.accounted_until_s:
+            raise ValueError("time_s must be within the cached MMPP interval")
+        count = bisect_right(pending.switches, time_s, key=lambda stats: stats.accounted_until_s)
+        anchor = pending.switches[count - 1] if count else self._stats
+        in_normal = (self._mode is GenerationMode.NORMAL) == (count % 2 == 0)
+        duration = time_s - anchor.accounted_until_s
+        return replace(
+            anchor,
+            normal_mode_duration_s=anchor.normal_mode_duration_s + (duration if in_normal else 0.0),
+            burst_mode_duration_s=anchor.burst_mode_duration_s + (0.0 if in_normal else duration),
+            accounted_until_s=time_s,
+        )
 
     def peek_next_event(self) -> MMPPEvent | None:
         """Return the cached next packet without committing mode or counter updates."""
@@ -171,6 +198,7 @@ class MMPPProcess:
         normal_packets = stats.packets_generated_in_normal
         burst_packets = stats.packets_generated_in_burst
         event = None
+        switches = []
 
         while time_s < self.end_time_s:
             if mode is GenerationMode.NORMAL:
@@ -208,6 +236,14 @@ class MMPPProcess:
             else:
                 mode = GenerationMode.NORMAL
                 burst_to_normal += 1
+            switches.append(replace(
+                stats,
+                normal_mode_duration_s=normal_duration,
+                burst_mode_duration_s=burst_duration,
+                normal_to_burst_transitions=normal_to_burst,
+                burst_to_normal_transitions=burst_to_normal,
+                accounted_until_s=time_s,
+            ))
 
         return _PendingOutcome(event, mode, MMPPStats(
             normal_mode_duration_s=normal_duration,
@@ -217,4 +253,4 @@ class MMPPProcess:
             packets_generated_in_normal=normal_packets,
             packets_generated_in_burst=burst_packets,
             accounted_until_s=time_s,
-        ))
+        ), tuple(switches))

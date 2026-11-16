@@ -28,7 +28,7 @@ def sample_times(schedule, seed=42, end_time_s=100.0, start_time_s=0.0):
 
 
 def make_ch(ch_id=0, capacity=10, policy=OverflowPolicy.DROP_OLDEST):
-    return ClusterHead(ch_id, (0.0, 0.0, -10.0), capacity, 20.0, 1.0, policy)
+    return ClusterHead(ch_id, (0.0, 0.0, -10.0), capacity, 20.0, overflow_policy=policy)
 
 
 def run_manager(manager):
