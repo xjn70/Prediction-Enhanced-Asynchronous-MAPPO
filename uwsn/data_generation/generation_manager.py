@@ -249,6 +249,11 @@ class GenerationManager:
         self._sample_pending_event(event.ch_id, registration)
         return GenerationResult(packet, result)
 
+    def public_packet_parameters(self, ch_id: int) -> PacketParameters | None:
+        """Return a CH's fixed packet size and VoI parameters, without its rates."""
+        registration = self._registrations.get(ch_id)
+        return None if registration is None else registration.packet_parameters
+
     def true_rate_at(self, ch_id: int, time_s: float | None = None) -> float:
         """Return the true rate in packets/s for Oracle or calibration use.
 

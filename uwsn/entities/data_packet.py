@@ -16,6 +16,28 @@ def _validate_volume_weight(volume_weight: float) -> float:
     return volume_weight
 
 
+def packet_voi_at_delivery(
+    generation_time_s: float,
+    base_value: float,
+    decay_rate_per_s: float,
+    delivery_time_s: float,
+    mission_deadline_s: float,
+    *,
+    volume_weight: float = DEFAULT_VOLUME_WEIGHT,
+) -> float:
+    """Compute v1.1 VoI from a generation timestamp and a fixed value profile."""
+    delivery_time_s = _nonnegative_float(delivery_time_s, "delivery_time_s")
+    mission_deadline_s = _nonnegative_float(mission_deadline_s, "mission_deadline_s")
+    volume_weight = _validate_volume_weight(volume_weight)
+    if delivery_time_s < generation_time_s:
+        raise ValueError("delivery_time_s cannot precede generation_time_s")
+    if delivery_time_s > mission_deadline_s:
+        return 0.0
+    age_s = delivery_time_s - generation_time_s
+    freshness = exp(-decay_rate_per_s * age_s)
+    return base_value * (volume_weight + (1.0 - volume_weight) * freshness)
+
+
 @dataclass(frozen=True)
 class DataPacket:
     """A packet with an immutable source, generation time, and VoI parameters."""
@@ -42,16 +64,10 @@ class DataPacket:
         volume_weight: float = DEFAULT_VOLUME_WEIGHT,
     ) -> float:
         """Return delivered packet value using a fixed amount term and a decaying term."""
-        delivery_time_s = _nonnegative_float(delivery_time_s, "delivery_time_s")
-        mission_deadline_s = _nonnegative_float(mission_deadline_s, "mission_deadline_s")
-        volume_weight = _validate_volume_weight(volume_weight)
-        if delivery_time_s < self.generation_time_s:
-            raise ValueError("delivery_time_s cannot precede generation_time_s")
-        if delivery_time_s > mission_deadline_s:
-            return 0.0
-        age_s = delivery_time_s - self.generation_time_s
-        freshness = exp(-self.decay_rate_per_s * age_s)
-        return self.base_value * (volume_weight + (1.0 - volume_weight) * freshness)
+        return packet_voi_at_delivery(
+            self.generation_time_s, self.base_value, self.decay_rate_per_s,
+            delivery_time_s, mission_deadline_s, volume_weight=volume_weight,
+        )
 
 
 def _packet_batch(packets: Iterable[DataPacket]) -> tuple[DataPacket, ...]:

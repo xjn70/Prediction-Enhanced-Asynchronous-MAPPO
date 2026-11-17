@@ -15,6 +15,8 @@ from ..navigation import TravelLeg, in_communication_range, plan_return, plan_vi
 from .event_queue import EventQueue
 from .events import EventType, SimulationEvent
 
+MAX_DECISIONS_PER_INSTANT = 100
+
 
 @dataclass(frozen=True)
 class CHArrival:
@@ -140,6 +142,7 @@ class Simulator:
         self.event_queue = EventQueue()
         self.event_log: list[EventLogEntry] = []
         self._decision_ready: set[int] = set()
+        self._decision_stamp: dict[int, tuple[float, int]] = {}
         self._plan_token = dict.fromkeys(self.auvs, 0)
         self._auv_reports: dict[tuple[int, int], CHReport] = {}
         self._finished = False
@@ -207,13 +210,22 @@ class Simulator:
         return auv
 
     def _schedule_arrival(self, auv_id: int, kind: EventType, leg: TravelLeg) -> None:
-        arrival_s = self.current_time_s + leg.travel_time_s
+        now_s = self.current_time_s
+        previous_s, previous_count = self._decision_stamp.get(auv_id, (now_s, 0))
+        count = previous_count + 1 if previous_s == now_s else 1
+        if count > MAX_DECISIONS_PER_INSTANT:
+            raise RuntimeError(
+                f"AUV {auv_id} exceeded {MAX_DECISIONS_PER_INSTANT} decisions at t={now_s:g} s "
+                "without time advancing"
+            )
+        arrival_s = now_s + leg.travel_time_s
         if leg.distance_m > 0:
-            arrival_s = max(arrival_s, nextafter(self.current_time_s, inf))
+            arrival_s = max(arrival_s, nextafter(now_s, inf))
         if arrival_s <= self.mission_duration_s:
             self._schedule_auv_event(arrival_s, kind, auv_id, leg, replace_plan=True)
         else:
             self._plan_token[auv_id] += 1
+        self._decision_stamp[auv_id] = (now_s, count)
 
     def _schedule_auv_event(
         self, time_s: float, kind: EventType, auv_id: int,

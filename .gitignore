@@ -20,3 +20,4 @@ wandb/
 *.pt
 *.pth
 *.ckpt
+*md
