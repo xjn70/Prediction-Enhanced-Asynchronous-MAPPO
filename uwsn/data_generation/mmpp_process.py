@@ -137,14 +137,10 @@ class MMPPProcess:
         of how often the simulation clock or diagnostics are updated.
         """
         time_s = _nonnegative_float(time_s, "time_s")
-        if time_s == self._stats.accounted_until_s:
-            return self._stats
-        pending = self._pending
-        if pending is None or not self._stats.accounted_until_s < time_s <= pending.stats.accounted_until_s:
-            raise ValueError("time_s must be within the cached MMPP interval")
-        count = bisect_right(pending.switches, time_s, key=lambda stats: stats.accounted_until_s)
-        anchor = pending.switches[count - 1] if count else self._stats
-        in_normal = (self._mode is GenerationMode.NORMAL) == (count % 2 == 0)
+        anchor, mode = self._diagnostic_state_at(time_s)
+        if time_s == anchor.accounted_until_s:
+            return anchor
+        in_normal = mode is GenerationMode.NORMAL
         duration = time_s - anchor.accounted_until_s
         return replace(
             anchor,
@@ -152,6 +148,22 @@ class MMPPProcess:
             burst_mode_duration_s=anchor.burst_mode_duration_s + (0.0 if in_normal else duration),
             accounted_until_s=time_s,
         )
+
+    def mode_at(self, time_s: float) -> GenerationMode:
+        """Return the hidden mode within the cached interval without drawing randomness."""
+        _, mode = self._diagnostic_state_at(_nonnegative_float(time_s, "time_s"))
+        return mode
+
+    def _diagnostic_state_at(self, time_s: float) -> tuple[MMPPStats, GenerationMode]:
+        if time_s == self._stats.accounted_until_s:
+            return self._stats, self._mode
+        pending = self._pending
+        if pending is None or not self._stats.accounted_until_s < time_s <= pending.stats.accounted_until_s:
+            raise ValueError("time_s must be within the cached MMPP interval")
+        count = bisect_right(pending.switches, time_s, key=lambda stats: stats.accounted_until_s)
+        anchor = pending.switches[count - 1] if count else self._stats
+        in_normal = (self._mode is GenerationMode.NORMAL) == (count % 2 == 0)
+        return anchor, GenerationMode.NORMAL if in_normal else GenerationMode.BURST
 
     def peek_next_event(self) -> MMPPEvent | None:
         """Return the cached next packet without committing mode or counter updates."""

@@ -42,7 +42,7 @@ class ClusterHead:
     position: Position3D
     buffer_capacity_bytes: int
     communication_radius_m: float
-    overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
+    overflow_policy: OverflowPolicy = OverflowPolicy.DROP_NEWEST
     total_generated_packets: int = field(init=False, default=0)
     total_generated_bytes: int = field(init=False, default=0)
     service_lock_owner: int | None = field(init=False, default=None)
@@ -50,6 +50,7 @@ class ClusterHead:
     _buffer: dict[int, DataPacket] = field(init=False, default_factory=dict, repr=False)
     _buffer_size_bytes: int = field(init=False, default=0, repr=False)
     _latest_generation_time_s: float = field(init=False, default=0.0, repr=False)
+    _reserved_packet_id: int | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         _require_int(self.ch_id, "ch_id")
@@ -70,6 +71,13 @@ class ClusterHead:
         """Return the current number of bytes stored at the CH."""
         return self._buffer_size_bytes
 
+    @property
+    def reserved_packet(self) -> DataPacket | None:
+        """Return the FIFO head in transmission, still counted in the CH buffer."""
+        if self._reserved_packet_id is None:
+            return None
+        return self._buffer[self._reserved_packet_id]
+
     def generate_packet(self, packet: DataPacket) -> BufferInsertResult:
         """Count a generated packet and apply the configured overflow policy."""
         if not isinstance(packet, DataPacket):
@@ -82,7 +90,9 @@ class ClusterHead:
         self.total_generated_packets += 1
         self.total_generated_bytes += packet.size_bytes
         self._latest_generation_time_s = max(self._latest_generation_time_s, packet.generation_time_s)
-        if packet.size_bytes > self.buffer_capacity_bytes:
+        reserved = self.reserved_packet
+        reserved_bytes = reserved.size_bytes if reserved is not None else 0
+        if packet.size_bytes + reserved_bytes > self.buffer_capacity_bytes:
             return BufferInsertResult(False, (packet,))
 
         free_bytes = self.buffer_capacity_bytes - self._buffer_size_bytes
@@ -91,7 +101,8 @@ class ClusterHead:
 
         dropped = []
         while packet.size_bytes > free_bytes:
-            oldest = self._buffer.pop(next(iter(self._buffer)))
+            oldest_id = next(packet_id for packet_id in self._buffer if packet_id != self._reserved_packet_id)
+            oldest = self._buffer.pop(oldest_id)
             dropped.append(oldest)
             free_bytes += oldest.size_bytes
         self._buffer[packet.packet_id] = packet
@@ -112,9 +123,37 @@ class ClusterHead:
 
     def remove_packets(self, packet_ids: Iterable[int]) -> tuple[DataPacket, ...]:
         """Remove the selected packets after validating the entire request."""
+        if not isinstance(packet_ids, Iterable):
+            raise ValueError("packet_ids must be an iterable of integers")
+        packet_ids = tuple(packet_ids)
+        if self._reserved_packet_id is not None and self._reserved_packet_id in packet_ids:
+            raise RuntimeError("cannot remove the packet reserved for transmission")
         removed = _remove_packet_batch(self._buffer, packet_ids)
         self._buffer_size_bytes -= sum(packet.size_bytes for packet in removed)
         return removed
+
+    def reserve_next_packet(self, auv_id: int, max_bytes: int) -> DataPacket | None:
+        """Reserve the FIFO head for the service owner if the whole packet fits."""
+        _require_int(auv_id, "auv_id")
+        _require_int(max_bytes, "max_bytes")
+        if self.service_lock_owner != auv_id or self._reserved_packet_id is not None:
+            raise RuntimeError("reservation requires ownership of a service lock and no active packet")
+        packet = next(iter(self._buffer.values()), None)
+        if packet is None or packet.size_bytes > max_bytes:
+            return None
+        self._reserved_packet_id = packet.packet_id
+        return packet
+
+    def complete_reserved_packet(self, auv_id: int, packet_id: int) -> DataPacket:
+        """Remove a fully transmitted packet from the CH after verifying ownership."""
+        _require_int(auv_id, "auv_id")
+        _require_int(packet_id, "packet_id")
+        if self.service_lock_owner != auv_id or self._reserved_packet_id != packet_id:
+            raise RuntimeError("packet is not reserved for this AUV")
+        packet = self._buffer.pop(packet_id)
+        self._buffer_size_bytes -= packet.size_bytes
+        self._reserved_packet_id = None
+        return packet
 
     def create_report(
         self, report_time_s: float, include_generation_counter: bool = False
@@ -142,15 +181,18 @@ class ClusterHead:
         new_expiry_s = _finite_float(now_s + lease_duration_s, "service_lock_expiry_s")
         if new_expiry_s <= now_s:
             raise ValueError("lease_duration_s is too short to advance the clock")
+        if self.service_lock_owner != auv_id:
+            self._reserved_packet_id = None
         self.service_lock_owner = auv_id
         self.service_lock_expiry_s = new_expiry_s
         return True
 
     def release_service_lock(self, auv_id: int) -> bool:
-        """Release the caller's lease and return whether it held the lock."""
+        """Release the caller's lease, leaving any unfinished packet in the CH."""
         _require_int(auv_id, "auv_id")
         if self.service_lock_owner != auv_id:
             return False
         self.service_lock_owner = None
         self.service_lock_expiry_s = None
+        self._reserved_packet_id = None
         return True
