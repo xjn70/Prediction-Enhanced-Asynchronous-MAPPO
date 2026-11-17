@@ -42,7 +42,7 @@ class ClusterHead:
     position: Position3D
     buffer_capacity_bytes: int
     communication_radius_m: float
-    overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST
+    overflow_policy: OverflowPolicy = OverflowPolicy.DROP_NEWEST
     total_generated_packets: int = field(init=False, default=0)
     total_generated_bytes: int = field(init=False, default=0)
     service_lock_owner: int | None = field(init=False, default=None)

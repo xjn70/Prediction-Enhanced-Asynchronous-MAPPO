@@ -65,6 +65,7 @@ def test_mmpp_requires_explicit_distinct_seeds_for_registered_chs():
 def test_competing_clocks_keep_mode_on_arrival_and_switch_in_both_directions():
     process = MMPPProcess(MMPPConfig(0.4, 6.0, 0.1, 0.25, random_seed=0), 6)
     # NORMAL switches at 2, BURST emits at 2.5, switches at 3.25, NORMAL emits at 3.75.
+    # Each pair is (arrival clock, switch clock) for the current mode.
     waits = [4, 2, 0.5, 2, 4, 0.75, 0.5, 8, 99, 99]
     with patch.object(process._rng, "expovariate", side_effect=waits) as draw:
         assert drain(process) == [
@@ -79,6 +80,7 @@ def test_competing_clocks_keep_mode_on_arrival_and_switch_in_both_directions():
 
 def test_peek_caches_waits_and_defers_statistics_including_final_tail():
     process = MMPPProcess(MMPPConfig(0, 2, 1, 1, random_seed=0), 10)
+    # NORMAL draws only a switch clock, then BURST draws (arrival, switch) twice.
     with patch.object(process._rng, "expovariate", side_effect=[2, 1, 6, 10, 10]) as draw:
         initial_stats = process.get_stats()
         event = process.peek_next_event()
@@ -144,6 +146,7 @@ def test_stationary_initialization_requires_a_positive_transition_rate():
 
 def test_zero_arrival_rates_still_account_for_all_mode_switches():
     process = MMPPProcess(MMPPConfig(0, 0, 2, 3, random_seed=0), 8, start_time_s=3)
+    # With both arrival rates zero, these are the NORMAL, BURST, NORMAL switch clocks.
     with patch.object(process._rng, "expovariate", side_effect=[1, 2, 2]) as draw:
         assert process.next_event() is None
         assert [call.args[0] for call in draw.call_args_list] == [2, 3, 2]
@@ -159,6 +162,7 @@ def test_zero_rate_mode_can_switch_to_an_emitting_mode(mode):
     else:
         config = MMPPConfig(2, 0, 0, 1, mode, random_seed=0)
     process = MMPPProcess(config, 10)
+    # The silent mode draws only a switch clock, then the absorbing mode only arrivals.
     with patch.object(process._rng, "expovariate", side_effect=[1, 0.5, 20]):
         events = drain(process)
     emitting_mode = GenerationMode.BURST if normal_is_silent else GenerationMode.NORMAL
@@ -167,6 +171,7 @@ def test_zero_rate_mode_can_switch_to_an_emitting_mode(mode):
 
 def test_packet_times_are_strictly_increasing_and_exclude_deadline():
     process = MMPPProcess(MMPPConfig(2, 0, 0, 0, random_seed=0), end_time_s=10, start_time_s=4)
+    # NORMAL is absorbing here, so every draw is an arrival clock.
     with patch.object(process._rng, "expovariate", side_effect=[1, 2, 3]):
         assert process.next_time_s() == 5
         assert process.next_time_s() == 7

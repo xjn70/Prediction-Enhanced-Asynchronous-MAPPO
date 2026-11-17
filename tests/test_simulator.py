@@ -27,7 +27,7 @@ END = EventType.MISSION_END
 
 
 def head(ch_id: int) -> ClusterHead:
-    return ClusterHead(ch_id, (0, 0, -10), 400, 30)
+    return ClusterHead(ch_id, (0, 0, -10), 400, 30, overflow_policy=OverflowPolicy.DROP_OLDEST)
 
 
 def vehicles() -> list[AUV]:
@@ -132,6 +132,7 @@ def test_ch_report_tracks_clock_and_rejects_backdating_after_dropped_packet():
     manager = GenerationManager(100)
     ch = ClusterHead(0, (0, 0, -10), 10, 30, overflow_policy=OverflowPolicy.DROP_NEWEST)
     manager.register_ch(ch, RateSchedule.fixed(1, 100), PARAMETERS, seed=10)
+    # The only Poisson CH draws one intensity gap per arrival and one at the cutoff.
     with patch.object(Random, "expovariate", side_effect=[25, 25, 25, 25]):
         sim = Simulator(100, generation_manager=manager)
         assert sim.create_ch_report(0).packet_timestamps == ()
@@ -158,12 +159,15 @@ def test_start_zero_rate_gap_same_time_order_and_exact_deadline():
 
     # The segmented CH consumes one unit of intensity before the zero-rate gap.
     # First arrivals tie at 2, and the next arrivals hit the deadline exactly.
+    # Initialization draws for CHs 2, 1, 3 in registration order. At t=2 it draws
+    # for CHs 1, 2, 3 in event order. MMPP CH 3 draws only its arrival clock.
     with patch.object(Random, "expovariate", side_effect=[2, 1, 2, 8, 8, 8]):
-        sim = Simulator(10, generation_manager=manager, auvs=vehicles())
+        extra_auv = AUV(3, (0, 0, 0), 1.0, 500)
+        sim = Simulator(10, generation_manager=manager, auvs=[*vehicles(), extra_auv])
         sim.schedule_event(0, READY, 0)
         sim.schedule_event(2, WAIT, 1)
         sim.schedule_event(10, WAIT, 2)
-        sim.schedule_event(11, WAIT, 0)
+        sim.schedule_event(11, WAIT, 3)
 
         assert [(entry.time_s, entry.event_type) for entry in sim.run_until(0)] == [(0, READY)]
         assert sim.decision_ready == {0}
@@ -182,6 +186,7 @@ def test_mmpp_silent_switches_follow_clock_even_with_no_pending_packet():
     manager = GenerationManager(10)
     manager.register_mmpp_ch(head(0), MMPPConfig(0, 0, 1, 2, random_seed=0), PARAMETERS)
     # There are switches at 2 and 5, with a would-be switch exactly at the deadline.
+    # MMPP draws only the switch clock in each mode because both arrival rates are zero.
     with patch.object(Random, "expovariate", side_effect=[2, 3, 5]) as draw:
         sim = Simulator(10, generation_manager=manager, auvs=vehicles())
         sim.schedule_event(5, WAIT, 0)
@@ -208,6 +213,7 @@ def test_mmpp_pending_packet_and_final_tail_are_counted_only_at_the_correct_time
     manager = GenerationManager(10)
     manager.register_mmpp_ch(head(0), MMPPConfig(0, 2, 1, 1, random_seed=0), PARAMETERS)
     # Switch at 1, generate in BURST at 3, switch at 5, then stay in NORMAL.
+    # Draws are NORMAL switch; BURST arrival and switch twice; NORMAL switch.
     with patch.object(Random, "expovariate", side_effect=[1, 2, 4, 3, 2, 6]) as draw:
         sim = Simulator(10, generation_manager=manager)
         diagnostics = sim.generation_manager.get_mode_stats
@@ -256,3 +262,51 @@ def test_invalid_scheduling_cannot_move_clock_or_clear_ready_auv():
     with pytest.raises(ValueError, match="unknown AUV"):
         sim.schedule_event(3, WAIT, 5)
     assert sim.current_time_s == 2 and sim.decision_ready == {0}
+
+
+def test_superseded_wait_is_ignored_and_latest_plan_wins():
+    sim = Simulator(100, auvs=vehicles())
+    sim.schedule_event(10, WAIT, 0)
+    sim.schedule_event(40, WAIT, 0)
+    entries = sim.run_until(20)
+    assert [(e.time_s, e.result) for e in entries] == [(10, "stale_ignored")]
+    assert sim.decision_ready == frozenset()
+    with pytest.raises(ValueError, match="past"):
+        sim.schedule_event(19, READY, 0)
+    sim.run_until(50)
+    assert sim.decision_ready == {0}
+
+
+def test_true_rate_follows_schedule_and_hidden_mode_without_consuming_randomness():
+    manager = GenerationManager(10)
+    segments = RateSchedule((RateSegment(0, 4, 0.5), RateSegment(6, 10, 2.0)))
+    manager.register_ch(head(0), segments, PARAMETERS, seed=1)
+    manager.register_mmpp_ch(head(1), MMPPConfig(0, 2, 1, 1, random_seed=2), PARAMETERS)
+    # Poisson CH 0 consumes the first intensity budget, which spans the mission.
+    # MMPP CH 1 draws NORMAL switch=1, then the two BURST clocks (2, 4), then
+    # (3, 2) after the arrival at t=3, and a NORMAL switch=6 after t=5.
+    with patch.object(Random, "expovariate", side_effect=[50, 1, 2, 4, 3, 2, 6]) as draw:
+        sim = Simulator(10, generation_manager=manager)
+        rates = []
+        for clock in (0, 1, 2, 4.5, 5, 6, 8):
+            sim.run_until(clock)
+            before = draw.call_count
+            rates.append(tuple(sim.generation_manager.true_rate_at(ch_id) for ch_id in (0, 1)))
+            assert sim.generation_manager.true_rate_at(1, clock) == rates[-1][1]
+            assert draw.call_count == before
+    assert rates == [(0.5, 0), (0.5, 2), (0.5, 2), (0.0, 2), (0.0, 0), (2.0, 0), (2.0, 0)]
+
+
+def test_disable_event_log_preserves_step_and_run_results():
+    def build(record_log):
+        sim = Simulator(10, auvs=vehicles(), record_log=record_log)
+        sim.schedule_event(1, WAIT, 0)
+        sim.schedule_event(2, WAIT, 1)
+        return sim
+
+    logged, unlogged = build(True), build(False)
+    assert unlogged.step_event() == logged.step_event()
+    assert unlogged.run_until(3) == logged.run_until(3)
+    assert unlogged.run() == logged.run()
+    assert unlogged.event_log == [] and len(logged.event_log) == 3
+    assert unlogged.decision_ready == logged.decision_ready == {0, 1}

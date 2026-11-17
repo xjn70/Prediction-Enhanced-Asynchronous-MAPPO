@@ -249,6 +249,29 @@ class GenerationManager:
         self._sample_pending_event(event.ch_id, registration)
         return GenerationResult(packet, result)
 
+    def true_rate_at(self, ch_id: int, time_s: float | None = None) -> float:
+        """Return the true rate in packets/s for Oracle or calibration use.
+
+        The time defaults to the synchronized simulation clock. For MMPP,
+        explicit times must be within the cached interval. Do not use this
+        method to populate AUV observations.
+        """
+        if not self._initialized:
+            raise RuntimeError("initialize generation before querying rates")
+        _require_int(ch_id, "ch_id")
+        if ch_id not in self._registrations:
+            raise KeyError(f"CH {ch_id} is not registered")
+        if time_s is None:
+            if self._clock_s is None:
+                raise ValueError("time_s is required without clock synchronization")
+            time_s = self._clock_s
+        process = self._registrations[ch_id].process
+        if isinstance(process, MMPPProcess):
+            if process.mode_at(time_s) is GenerationMode.NORMAL:
+                return process.config.lambda_normal_pps
+            return process.config.lambda_burst_pps
+        return process.schedule.rate_at(time_s)
+
     def get_mode_stats(self, ch_id: int) -> MMPPStats:
         """Return simulation-only MMPP diagnostics with their accounting time.
 

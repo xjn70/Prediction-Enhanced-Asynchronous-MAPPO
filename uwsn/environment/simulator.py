@@ -31,6 +31,12 @@ class CollectionResult:
 
 
 @dataclass(frozen=True)
+class _AUVPlanEvent:
+    token: int
+    data: TravelLeg | DataPacket | None = None
+
+
+@dataclass(frozen=True)
 class EventLogEntry:
     """Simulation-only execution record, including the handler result."""
 
@@ -60,6 +66,7 @@ class Simulator:
         sink: Sink | None = None,
         collection_rate_bytes_per_s: float = 1000.0,
         include_generation_counter: bool = False,
+        record_log: bool = True,
     ) -> None:
         self.mission_duration_s = _positive_float(mission_duration_s, "mission_duration_s")
         self.collection_rate_bytes_per_s = _positive_float(
@@ -67,7 +74,10 @@ class Simulator:
         )
         if not isinstance(include_generation_counter, bool):
             raise ValueError("include_generation_counter must be a bool")
+        if not isinstance(record_log, bool):
+            raise ValueError("record_log must be a bool")
         self.include_generation_counter = include_generation_counter
+        self.record_log = record_log
         manager = generation_manager
         if manager is None:
             manager = GenerationManager(self.mission_duration_s)
@@ -91,7 +101,7 @@ class Simulator:
 
     @property
     def decision_ready(self) -> frozenset[int]:
-        """Return the IDs of AUVs that are ready for a new decision."""
+        """Return the ready IDs. Submit simultaneous decisions in sorted ID order."""
         return frozenset(self._decision_ready)
 
     def create_ch_report(self, ch_id: int, *, include_generation_counter: bool = False) -> CHReport:
@@ -121,6 +131,7 @@ class Simulator:
         self.event_queue = EventQueue()
         self.event_log: list[EventLogEntry] = []
         self._decision_ready: set[int] = set()
+        self._plan_token = dict.fromkeys(self.auvs, 0)
         self._auv_reports: dict[tuple[int, int], CHReport] = {}
         self._finished = False
         initial_packet_ids = [packet.packet_id for ch in self.cluster_heads.values() for packet in ch.buffer]
@@ -137,7 +148,7 @@ class Simulator:
     def schedule_event(self, time_s: float, event_type: EventType, entity_id: int) -> SimulationEvent:
         """Schedule AUV decision readiness or wait completion.
 
-        Scheduling a wait clears only that AUV's readiness. Milestones at the
+        Scheduling replaces that AUV's previous plan and clears its readiness. Milestones at the
         deadline can execute before MISSION_END. Later ones are discarded there.
         """
         if self._finished:
@@ -149,9 +160,8 @@ class Simulator:
             raise ValueError(f"unknown AUV ID {entity_id}")
         if self.auvs[entity_id].status is not AUVStatus.IDLE:
             raise RuntimeError("cannot schedule decision readiness for a busy AUV")
-        event = self.event_queue.push(time_s, event_type, entity_id)
-        if event_type is EventType.WAIT_COMPLETE:
-            self._decision_ready.discard(entity_id)
+        event = self._schedule_auv_event(time_s, event_type, entity_id, replace_plan=True)
+        self._decision_ready.discard(entity_id)
         return event
 
     def visit(self, auv_id: int, ch_id: int) -> TravelLeg:
@@ -192,7 +202,18 @@ class Simulator:
         if leg.distance_m > 0:
             arrival_s = max(arrival_s, nextafter(self.current_time_s, inf))
         if arrival_s <= self.mission_duration_s:
-            self.event_queue.push(arrival_s, kind, auv_id, leg)
+            self._schedule_auv_event(arrival_s, kind, auv_id, leg, replace_plan=True)
+        else:
+            self._plan_token[auv_id] += 1
+
+    def _schedule_auv_event(
+        self, time_s: float, kind: EventType, auv_id: int,
+        data: TravelLeg | DataPacket | None = None, *, replace_plan: bool = False,
+    ) -> SimulationEvent:
+        token = self._plan_token[auv_id] + int(replace_plan)
+        event = self.event_queue.push(time_s, kind, auv_id, _AUVPlanEvent(token, data))
+        self._plan_token[auv_id] = token
+        return event
 
     def step_event(self) -> EventLogEntry | None:
         """Process the earliest event, or return None after mission end."""
@@ -203,7 +224,8 @@ class Simulator:
         self.event_queue.pop()
         result = self._handle_event(event)
         entry = EventLogEntry(event.time_s, event.event_type, event.entity_id, result)
-        self.event_log.append(entry)
+        if self.record_log:
+            self.event_log.append(entry)
         return entry
 
     def run_until(self, time_s: float) -> tuple[EventLogEntry, ...]:
@@ -211,12 +233,14 @@ class Simulator:
         limit = min(_nonnegative_float(time_s, "time_s"), self.mission_duration_s)
         if limit < self.current_time_s:
             raise ValueError("cannot run the simulator backwards")
-        first_record = len(self.event_log)
+        records = []
         while not self._finished and (event := self.event_queue.peek()) is not None and event.time_s <= limit:
-            self.step_event()
+            entry = self.step_event()
+            assert entry is not None
+            records.append(entry)
         self.generation_manager.advance_to(limit)
         self.event_queue.advance_to(limit)
-        return tuple(self.event_log[first_record:])
+        return tuple(records)
 
     def run(self) -> tuple[EventLogEntry, ...]:
         """Run through the mission deadline and return the newly processed records."""
@@ -236,28 +260,33 @@ class Simulator:
             result = self.generation_manager.process_event(payload)
             self._schedule_next_generation()
             return result
-        if event.event_type in (EventType.AUV_DECISION_READY, EventType.WAIT_COMPLETE):
-            assert event.entity_id is not None
-            if self.auvs[event.entity_id].status is not AUVStatus.IDLE:
-                return "decision_not_ready"
-            self._decision_ready.add(event.entity_id)
-            return "decision_ready"
-        if event.event_type is EventType.AUV_ARRIVAL_CH:
-            assert event.entity_id is not None and isinstance(event.payload, TravelLeg)
-            return self._arrive_at_ch(self.auvs[event.entity_id], event.payload)
-        if event.event_type is EventType.COLLECTION_COMPLETE:
-            assert event.entity_id is not None and isinstance(event.payload, DataPacket)
-            return self._complete_packet(self.auvs[event.entity_id], event.payload)
-        if event.event_type is EventType.AUV_ARRIVAL_SINK:
-            assert event.entity_id is not None and isinstance(event.payload, TravelLeg)
-            auv = self.auvs[event.entity_id]
-            auv.position = event.payload.destination
-            auv.status = AUVStatus.WAITING_SINK
-            return "arrived_sink"
         if event.event_type is EventType.MISSION_END:
             self._finished = True
             self.event_queue.clear()
             return "mission_ended"
+        if not isinstance(event.payload, _AUVPlanEvent) or event.entity_id is None:
+            raise NotImplementedError(f"no simulator handler for {event.event_type.value}")
+        if event.payload.token != self._plan_token[event.entity_id]:
+            return "stale_ignored"
+
+        auv = self.auvs[event.entity_id]
+        data = event.payload.data
+        if event.event_type in (EventType.AUV_DECISION_READY, EventType.WAIT_COMPLETE):
+            if auv.status is not AUVStatus.IDLE:
+                return "decision_not_ready"
+            self._decision_ready.add(event.entity_id)
+            return "decision_ready"
+        if event.event_type is EventType.AUV_ARRIVAL_CH:
+            assert isinstance(data, TravelLeg)
+            return self._arrive_at_ch(auv, data)
+        if event.event_type is EventType.COLLECTION_COMPLETE:
+            assert isinstance(data, DataPacket)
+            return self._complete_packet(auv, data)
+        if event.event_type is EventType.AUV_ARRIVAL_SINK:
+            assert isinstance(data, TravelLeg)
+            auv.position = data.destination
+            auv.status = AUVStatus.WAITING_SINK
+            return "arrived_sink"
         raise NotImplementedError(f"no simulator handler for {event.event_type.value}")
 
     def _arrive_at_ch(self, auv: AUV, leg: TravelLeg) -> CHArrival:
@@ -292,7 +321,7 @@ class Simulator:
         except OverflowError:
             duration_s = inf
         completion_s = max(self.current_time_s + duration_s, nextafter(self.current_time_s, inf))
-        self.event_queue.push(
+        self._schedule_auv_event(
             min(completion_s, self.mission_duration_s), EventType.COLLECTION_COMPLETE, auv.auv_id, packet
         )
         return True
@@ -315,4 +344,4 @@ class Simulator:
         auv.target_ch_id = None
         auv.status = AUVStatus.IDLE
         if self.current_time_s < self.mission_duration_s:
-            self.event_queue.push(self.current_time_s, EventType.AUV_DECISION_READY, auv.auv_id)
+            self._schedule_auv_event(self.current_time_s, EventType.AUV_DECISION_READY, auv.auv_id)

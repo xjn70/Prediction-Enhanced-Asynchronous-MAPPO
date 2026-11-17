@@ -115,6 +115,14 @@ def test_ch_drop_oldest_evicts_only_the_required_fifo_prefix():
     assert ch.total_generated_bytes == 15
 
 
+def test_default_overflow_policy_preserves_the_fifo_head():
+    ch = ClusterHead(0, (0, 0, 0), 4, 30)
+    first, second = packet(1), packet(2)
+    assert ch.generate_packet(first).inserted
+    assert ch.generate_packet(second) == BufferInsertResult(False, (second,))
+    assert ch.buffer == (first,)
+
+
 def test_ch_drop_newest_counts_rejected_packets():
     ch = cluster_head(OverflowPolicy.DROP_NEWEST)
     first, second = packet(1, 6), packet(2, 5)

@@ -1,5 +1,6 @@
 """Integration tests for arrival, report access, and packet conservation."""
 
+from dataclasses import fields
 from math import inf, nextafter
 from random import Random
 from unittest.mock import patch
@@ -46,6 +47,7 @@ def test_arrival_gates_local_report_and_generation_continues_during_travel_and_c
     ch = head(position=(10, 0, 0))
     manager = GenerationManager(20)
     manager.register_ch(ch, RateSchedule.fixed(1, 20), PacketParameters(4, 1.0, 0.01), seed=1)
+    # CH 0 alone draws intensity gaps of 2, 3, 4, 1, 2 and a post-cutoff gap.
     with patch.object(Random, "expovariate", side_effect=[2, 3, 4, 1, 2, 100]):
         sim = Simulator(20, generation_manager=manager, auvs=[AUV(0, (0, 0, 0), 1, 100)],
                         collection_rate_bytes_per_s=4, include_generation_counter=True)
@@ -67,6 +69,9 @@ def test_arrival_gates_local_report_and_generation_continues_during_travel_and_c
         assert sim.auvs[0].position == (9, 0, 0)
         report = sim.get_auv_ch_report(0, 0)
         assert report is not None
+        assert {field.name for field in fields(report)} == {
+            "ch_id", "report_time_s", "buffer_size_bytes", "packet_timestamps", "total_generated_packets",
+        }
         assert report.report_time_s == 9 and report.total_generated_packets == 3
         assert report.packet_timestamps == (2.0, 5.0, 9.0) and report.buffer_size_bytes == 12
         assert sim.auvs[0].cargo == () and sim.cluster_heads[0].reserved_packet is not None
@@ -159,6 +164,18 @@ def test_lease_roundoff_does_not_allow_another_auv_to_steal_an_in_flight_packet(
     assert sim.auvs[0].cargo == (packet,) and sim.auvs[1].cargo == ()
 
 
+def test_starting_a_macro_action_clears_only_that_auvs_readiness():
+    auvs = [AUV(auv_id, (0, 0, 0), 1, 10) for auv_id in (7, 1)]
+    sim = Simulator(20, cluster_heads=[head(position=(5, 0, 0))], auvs=auvs)
+    initialize_auvs(sim)
+    assert sim.decision_ready == {1, 7}
+    first, second = sorted(sim.decision_ready)
+    sim.visit(first, 0)
+    assert sim.decision_ready == {second}
+    assert sim.auvs[first].status is AUVStatus.NAVIGATING
+    assert sim.auvs[second].status is AUVStatus.IDLE
+
+
 @pytest.mark.parametrize("deadline", [3, 4])
 @pytest.mark.parametrize("policy,new_size,expected_ids", [
     (OverflowPolicy.DROP_OLDEST, 4, (10, 13)),
@@ -170,6 +187,7 @@ def test_cutoff_cancels_reserved_packet_without_losing_it_to_overflow(deadline, 
     initial = [add_packet(ch, index, 4) for index in (10, 11)]
     manager = GenerationManager(deadline)
     manager.register_ch(ch, RateSchedule.fixed(1, deadline), PacketParameters(new_size, 1, 0), seed=1)
+    # Poisson CH 0 draws two one-second gaps, then one that skips the deadline.
     with patch.object(Random, "expovariate", side_effect=[1, 1, 100]):
         sim = Simulator(deadline, generation_manager=manager, auvs=[AUV(0, (0, 0, 0), 1, 12)],
                         collection_rate_bytes_per_s=1)
@@ -239,6 +257,7 @@ def test_generation_uses_ids_above_initial_cargo_and_unregistered_ch_buffers():
     auv.load_packets((DataPacket(120, 1, 0, 1, 1, 0),))
     manager = GenerationManager(5)
     manager.register_ch(generated_head, RateSchedule.fixed(1, 5), PacketParameters(1, 1, 0), seed=1)
+    # Only registered CH 0 draws an arrival at t=1 and a post-cutoff gap.
     with patch.object(Random, "expovariate", side_effect=[1, 10]):
         sim = Simulator(5, generation_manager=manager, cluster_heads=[generated_head, preloaded_head], auvs=[auv])
         sim.run()

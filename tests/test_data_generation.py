@@ -104,6 +104,7 @@ def test_residual_intensity_crosses_rate_changes_and_zero_segments_without_redra
         RateSegment(0, 1, 1), RateSegment(1, 3, 0), RateSegment(5, 10, 2),
     ))
     process = PoissonProcess(schedule, 10, seed=1)
+    # One intensity budget spans all three segments.
     with patch.object(process._rng, "expovariate", return_value=2.5) as draw:
         assert process.next_time_s() == 5.75  # 5 + (2.5 - 1) / 2
         draw.assert_called_once_with(1.0)
@@ -162,6 +163,7 @@ def test_mission_window_clips_schedule_at_both_ends():
 def test_exact_intensity_boundary_uses_next_positive_segment():
     schedule = RateSchedule((RateSegment(0, 1, 1), RateSegment(1, 2, 0), RateSegment(2, 3, 1)))
     process = PoissonProcess(schedule, 3, seed=1)
+    # An identical budget of one is drawn for the first arrival and again for the cutoff.
     with patch.object(process._rng, "expovariate", return_value=1.0):
         assert process.next_time_s() == 2.0
         assert process.next_time_s() is None  # Exact mission end is excluded.
