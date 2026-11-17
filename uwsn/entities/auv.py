@@ -43,6 +43,11 @@ class AUV:
         """Return the available cargo space in bytes."""
         return self.storage_capacity_bytes - self.storage_used_bytes
 
+    def get_packet(self, packet_id: int) -> DataPacket | None:
+        """Return a cargo packet by ID without changing its storage or order."""
+        _require_int(packet_id, "packet_id")
+        return self._cargo.get(packet_id)
+
     def can_load_packets(self, packets: Iterable[DataPacket]) -> bool:
         """Check if the entire packet batch fits and contains only new IDs."""
         return self._load_error(_packet_batch(packets)) is None

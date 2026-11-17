@@ -230,11 +230,13 @@ def test_return_updates_position_and_leaves_cargo_and_sink_ledger_intact():
     assert leg.distance_m == 13 and leg.travel_time_s == 6.5
     sim.run_until(6)
     assert sim.auvs[0].position == (0, 0, 0) and sim.auvs[0].status is AUVStatus.RETURNING
-    arrived, = sim.run_until(6.5)
-    assert arrived.event_type is EventType.AUV_ARRIVAL_SINK
+    arrived = sim.step_event()
+    assert arrived is not None
+    assert arrived.time_s == 6.5 and arrived.event_type is EventType.AUV_ARRIVAL_SINK
     assert sim.auvs[0].position == sink.position and sim.auvs[0].status is AUVStatus.WAITING_SINK
     assert sim.auvs[0].cargo == (packet,) and sim.decision_ready == set()
-    assert sim.sink is not None and sim.sink.waiting_queue == () and sim.sink.delivered_records == ()
+    assert sim.sink is not None and sim.sink.active_upload is None and sim.sink.delivered_records == ()
+    assert len(sim.sink.waiting_queue) == 1 and sim.sink.waiting_queue[0].packets == (packet,)
     assert sim.sink.total_voi == 0
 
 

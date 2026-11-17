@@ -7,7 +7,9 @@ from math import inf, nextafter
 from typing import Literal
 
 from ..data_generation import GenerationEvent, GenerationManager, GenerationResult
-from ..entities import AUV, AUVStatus, CHReport, ClusterHead, DataPacket, Sink
+from ..entities import (
+    AUV, AUVStatus, CHReport, ClusterHead, DataPacket, DeliveryRecord, PacketCompletion, Sink, UploadJob,
+)
 from ..entities.common import _nonnegative_float, _positive_float, _require_int
 from ..navigation import TravelLeg, in_communication_range, plan_return, plan_visit
 from .event_queue import EventQueue
@@ -33,7 +35,10 @@ class CollectionResult:
 @dataclass(frozen=True)
 class _AUVPlanEvent:
     token: int
-    data: TravelLeg | DataPacket | None = None
+    data: TravelLeg | DataPacket | PacketCompletion | None = None
+
+
+EventResult = GenerationResult | CHArrival | CollectionResult | UploadJob | DeliveryRecord | str
 
 
 @dataclass(frozen=True)
@@ -43,7 +48,7 @@ class EventLogEntry:
     time_s: float
     event_type: EventType
     entity_id: int | None
-    result: GenerationResult | CHArrival | CollectionResult | str
+    result: EventResult
 
 
 class Simulator:
@@ -52,8 +57,8 @@ class Simulator:
     Provide an uninitialized manager with the same [0, mission_duration_s)
     window. By default, cluster_heads are taken from its registrations. Reset
     restores entities and RNG state and clears manually scheduled AUV events.
-    Read live entities from the simulator and schedule AUV milestones via
-    schedule_event. The queue and log are simulation diagnostics.
+    Provide a fresh Sink for the mission. Its queue and ledger, the event queue
+    and the event log are simulation diagnostics.
     """
 
     def __init__(
@@ -92,6 +97,10 @@ class Simulator:
             raise ValueError("CH and AUV IDs must be unique within each entity type")
         if any(heads_by_id.get(ch.ch_id) is not ch for ch in registered):
             raise ValueError("cluster_heads must contain the same entities registered for generation")
+        if sink is not None and (
+            sink.active_upload is not None or sink.waiting_queue or sink.delivered_records or sink.interrupted_uploads
+        ):
+            raise ValueError("the simulator requires a fresh Sink without upload history")
         self._initial_scenario = deepcopy((heads_by_id, vehicles_by_id, sink, manager))
         self.reset()
 
@@ -177,7 +186,7 @@ class Simulator:
         return leg
 
     def return_to_sink(self, auv_id: int) -> TravelLeg:
-        """Start straight-line return; arrival enters WAITING_SINK with cargo intact."""
+        """Start a straight-line return followed by FCFS upload of the current cargo."""
         auv = self._require_decision_ready(auv_id)
         if self.sink is None:
             raise RuntimeError("the simulator has no Sink")
@@ -208,7 +217,7 @@ class Simulator:
 
     def _schedule_auv_event(
         self, time_s: float, kind: EventType, auv_id: int,
-        data: TravelLeg | DataPacket | None = None, *, replace_plan: bool = False,
+        data: TravelLeg | DataPacket | PacketCompletion | None = None, *, replace_plan: bool = False,
     ) -> SimulationEvent:
         token = self._plan_token[auv_id] + int(replace_plan)
         event = self.event_queue.push(time_s, kind, auv_id, _AUVPlanEvent(token, data))
@@ -252,7 +261,7 @@ class Simulator:
         if pending is not None and pending.time_s < self.mission_duration_s:
             self.event_queue.push(pending.time_s, EventType.CH_DATA_GENERATION, pending.ch_id, pending)
 
-    def _handle_event(self, event: SimulationEvent) -> GenerationResult | CHArrival | CollectionResult | str:
+    def _handle_event(self, event: SimulationEvent) -> EventResult:
         if event.event_type is EventType.CH_DATA_GENERATION:
             payload = event.payload
             if not isinstance(payload, GenerationEvent) or event.time_s >= self.mission_duration_s:
@@ -261,6 +270,10 @@ class Simulator:
             self._schedule_next_generation()
             return result
         if event.event_type is EventType.MISSION_END:
+            if self.sink is not None:
+                self.sink.interrupt_uploads(self.current_time_s)
+                for upload in self.sink.interrupted_uploads:
+                    self.auvs[upload.auv_id].status = AUVStatus.WAITING_SINK
             self._finished = True
             self.event_queue.clear()
             return "mission_ended"
@@ -284,9 +297,15 @@ class Simulator:
             return self._complete_packet(auv, data)
         if event.event_type is EventType.AUV_ARRIVAL_SINK:
             assert isinstance(data, TravelLeg)
-            auv.position = data.destination
-            auv.status = AUVStatus.WAITING_SINK
+            self._arrive_at_sink(auv, data)
             return "arrived_sink"
+        if event.event_type is EventType.UPLOAD_START:
+            return self._start_upload(auv)
+        if event.event_type is EventType.PACKET_UPLOAD_COMPLETE:
+            assert isinstance(data, PacketCompletion)
+            return self._complete_upload_packet(auv, data)
+        if event.event_type is EventType.UPLOAD_COMPLETE:
+            return self._finish_upload(auv)
         raise NotImplementedError(f"no simulator handler for {event.event_type.value}")
 
     def _arrive_at_ch(self, auv: AUV, leg: TravelLeg) -> CHArrival:
@@ -342,6 +361,77 @@ class Simulator:
         if ch is not None:
             ch.release_service_lock(auv.auv_id)
         auv.target_ch_id = None
+        auv.status = AUVStatus.IDLE
+        if self.current_time_s < self.mission_duration_s:
+            self._schedule_auv_event(self.current_time_s, EventType.AUV_DECISION_READY, auv.auv_id)
+
+    def _arrive_at_sink(self, auv: AUV, leg: TravelLeg) -> None:
+        sink = self.sink
+        assert sink is not None
+        auv.position = leg.destination
+        cargo = auv.cargo
+        if not cargo:
+            self._finish_return(auv)
+            return
+
+        queue_was_empty = not sink.waiting_queue
+        sink.enqueue_upload(auv.auv_id, cargo, self.current_time_s)
+        auv.status = AUVStatus.WAITING_SINK
+        if queue_was_empty and sink.active_upload is None:
+            self._schedule_upload_start()
+
+    def _schedule_upload_start(self) -> None:
+        sink = self.sink
+        assert sink is not None
+        queue = sink.waiting_queue
+        if queue and self.current_time_s < self.mission_duration_s:
+            self._schedule_auv_event(self.current_time_s, EventType.UPLOAD_START, queue[0].auv_id)
+
+    def _start_upload(self, auv: AUV) -> UploadJob:
+        sink = self.sink
+        assert sink is not None
+        job = sink.start_next_upload(self.current_time_s)
+        if job is None or job.request.auv_id != auv.auv_id:
+            raise RuntimeError("scheduled upload start does not match the FCFS request")
+        auv.status = AUVStatus.UPLOADING
+        self._schedule_upload_packet(auv, job.packet_completions[0])
+        return job
+
+    def _schedule_upload_packet(self, auv: AUV, completion: PacketCompletion) -> None:
+        if completion.completion_time_s <= self.mission_duration_s:
+            self._schedule_auv_event(
+                completion.completion_time_s, EventType.PACKET_UPLOAD_COMPLETE, auv.auv_id, completion
+            )
+
+    def _complete_upload_packet(self, auv: AUV, completion: PacketCompletion) -> DeliveryRecord:
+        sink = self.sink
+        assert sink is not None
+        job = sink.active_upload
+        if job is None or job.request.auv_id != auv.auv_id:
+            raise RuntimeError("packet completion does not match the active upload")
+        if auv.get_packet(completion.packet_id) != completion.packet:
+            raise RuntimeError("packet completion requires the original packet in the AUV cargo")
+        record = sink.record_packet_delivery(completion.packet_id, self.current_time_s, self.mission_duration_s)
+        auv.remove_packets((record.packet_id,))
+        next_completion = sink.next_packet_completion
+        if next_completion is None:
+            self._schedule_auv_event(self.current_time_s, EventType.UPLOAD_COMPLETE, auv.auv_id)
+        else:
+            self._schedule_upload_packet(auv, next_completion)
+        return record
+
+    def _finish_upload(self, auv: AUV) -> UploadJob:
+        sink = self.sink
+        assert sink is not None
+        job = sink.active_upload
+        if job is None or job.request.auv_id != auv.auv_id:
+            raise RuntimeError("upload completion does not match the active upload")
+        sink.finish_active_upload(self.current_time_s, start_next=False)
+        self._schedule_upload_start()
+        self._finish_return(auv)
+        return job
+
+    def _finish_return(self, auv: AUV) -> None:
         auv.status = AUVStatus.IDLE
         if self.current_time_s < self.mission_duration_s:
             self._schedule_auv_event(self.current_time_s, EventType.AUV_DECISION_READY, auv.auv_id)

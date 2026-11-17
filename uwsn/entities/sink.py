@@ -66,6 +66,32 @@ class DeliveryRecord:
         """Return the ID to remove from the delivering AUV's cargo."""
         return self.packet.packet_id
 
+    @property
+    def source_ch_id(self) -> int:
+        return self.packet.source_ch_id
+
+    @property
+    def generation_time_s(self) -> float:
+        return self.packet.generation_time_s
+
+    @property
+    def size_bytes(self) -> int:
+        return self.packet.size_bytes
+
+    @property
+    def delivered_voi(self) -> float:
+        return self.voi
+
+
+@dataclass(frozen=True)
+class InterruptedUpload:
+    """An unserved or partially served request, with only undelivered packets."""
+
+    auv_id: int
+    packets: tuple[DataPacket, ...]
+    arrival_time_s: float
+    start_time_s: float | None
+
 
 @dataclass
 class Sink:
@@ -79,8 +105,10 @@ class Sink:
     _delivered_records: list[DeliveryRecord] = field(init=False, default_factory=list, repr=False)
     _delivered_packet_ids: set[int] = field(init=False, default_factory=set, repr=False)
     _pending_packet_ids: set[int] = field(init=False, default_factory=set, repr=False)
+    _pending_auv_ids: set[int] = field(init=False, default_factory=set, repr=False)
     _next_completion_index: int = field(init=False, default=0, repr=False)
     _channel_released_at_s: float = field(init=False, default=0.0, repr=False)
+    _interrupted_uploads: tuple[InterruptedUpload, ...] = field(init=False, default=(), repr=False)
 
     def __post_init__(self) -> None:
         self.position = _validate_position(self.position)
@@ -98,6 +126,19 @@ class Sink:
     def active_upload(self) -> UploadJob | None:
         """Return the current upload, if the channel is occupied."""
         return self._active_upload
+
+    @property
+    def next_packet_completion(self) -> PacketCompletion | None:
+        """Return the next expected packet of the active job, if any."""
+        job = self._active_upload
+        if job is None or self._next_completion_index == len(job.packet_completions):
+            return None
+        return job.packet_completions[self._next_completion_index]
+
+    @property
+    def interrupted_uploads(self) -> tuple[InterruptedUpload, ...]:
+        """Return diagnostics for requests left incomplete when service stopped."""
+        return self._interrupted_uploads
 
     @property
     def delivered_records(self) -> tuple[DeliveryRecord, ...]:
@@ -131,12 +172,15 @@ class Sink:
             raise ValueError("an upload packet_id is already queued or in service")
         if not packet_ids.isdisjoint(self._delivered_packet_ids):
             raise ValueError("an upload packet_id has already been delivered")
+        if auv_id in self._pending_auv_ids:
+            raise ValueError(f"AUV {auv_id} already has a queued or active upload")
         if any(packet.generation_time_s > arrival_time_s for packet in batch):
             raise ValueError("arrival_time_s cannot precede an upload packet's generation")
 
         request = UploadRequest(auv_id, batch, arrival_time_s)
         insort_right(self._waiting_queue, request, key=lambda item: item.arrival_time_s)
         self._pending_packet_ids.update(packet_ids)
+        self._pending_auv_ids.add(auv_id)
         return request
 
     def start_next_upload(self, current_time_s: float) -> UploadJob | None:
@@ -185,9 +229,9 @@ class Sink:
         if job is None:
             raise RuntimeError("there is no active upload")
 
-        if self._next_completion_index == len(job.packet_completions):
+        completion = self.next_packet_completion
+        if completion is None:
             raise KeyError(f"packet_id {packet_id} is not in the active upload")
-        completion = job.packet_completions[self._next_completion_index]
         if packet_id != completion.packet_id:
             if any(item.packet_id == packet_id for item in job.packet_completions):
                 raise RuntimeError("packet deliveries must follow the upload order")
@@ -210,8 +254,8 @@ class Sink:
         self._next_completion_index += 1
         return record
 
-    def finish_active_upload(self, current_time_s: float) -> UploadJob | None:
-        """Release a completed channel and start the next arrived request."""
+    def finish_active_upload(self, current_time_s: float, *, start_next: bool = True) -> UploadJob | None:
+        """Release a completed channel, optionally starting the next arrived request."""
         current_time_s = _nonnegative_float(current_time_s, "current_time_s")
         job = self._active_upload
         if job is None:
@@ -221,5 +265,31 @@ class Sink:
         if self._next_completion_index != len(job.packet_completions):
             raise RuntimeError("cannot finish an upload with undelivered packets")
         self._active_upload = None
+        self._pending_auv_ids.remove(job.request.auv_id)
         self._channel_released_at_s = current_time_s
-        return self.start_next_upload(current_time_s)
+        return self.start_next_upload(current_time_s) if start_next else None
+
+    def interrupt_uploads(self, current_time_s: float) -> None:
+        """Stop service, retaining completed deliveries and recording pending packets."""
+        current_time_s = _nonnegative_float(current_time_s, "current_time_s")
+        job = self._active_upload
+        if current_time_s < self._channel_released_at_s or (
+            job is not None and current_time_s < job.start_time_s
+        ):
+            raise ValueError("cannot interrupt uploads in the past")
+        pending = []
+        if job is not None and self.next_packet_completion is not None:
+            request = job.request
+            remaining = request.packets[self._next_completion_index:]
+            pending.append(InterruptedUpload(request.auv_id, remaining, request.arrival_time_s, job.start_time_s))
+        pending.extend(
+            InterruptedUpload(request.auv_id, request.packets, request.arrival_time_s, None)
+            for request in self._waiting_queue
+        )
+        self._interrupted_uploads = (*self._interrupted_uploads, *pending)
+        self._waiting_queue.clear()
+        self._active_upload = None
+        self._pending_packet_ids.clear()
+        self._pending_auv_ids.clear()
+        self._next_completion_index = 0
+        self._channel_released_at_s = current_time_s

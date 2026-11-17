@@ -13,7 +13,8 @@ from uwsn.entities import AUV, ClusterHead, Sink
 from uwsn.environment import CHArrival, CollectionResult, EventType, Simulator
 
 
-def main() -> None:
+def make_collection_scenario(upload_rate_bytes_per_s: float = 1000) -> tuple[Simulator, dict[int, deque[int]]]:
+    """Build the shared 75-second collection and return scenario."""
     deadline_s = 75.0
     manager = GenerationManager(deadline_s)
     positions = ((12, 0, -5), (0, 24, -5), (25, 8, -7), (0, -15, -8), (-12, 10, -4))
@@ -28,10 +29,16 @@ def main() -> None:
         AUV(2, (0, 0, -5), 1.5, storage_capacity_bytes=2500),
     )
     sim = Simulator(deadline_s, generation_manager=manager, auvs=auvs,
-                    sink=Sink((0, 0, 0), 1000), collection_rate_bytes_per_s=250)
+                    sink=Sink((0, 0, 0), upload_rate_bytes_per_s), collection_rate_bytes_per_s=250)
     targets = {0: deque([0]), 1: deque([0, 2]), 2: deque([1])}
+    return sim, targets
+
+
+def main() -> None:
+    sim, targets = make_collection_scenario()
+    returned: set[int] = set()
     collection_starts: dict[int, tuple[int, int, int]] = {}
-    for auv in auvs:
+    for auv in sim.auvs.values():
         print(f"AUV {auv.auv_id} initial position={auv.position}, targets={list(targets[auv.auv_id])}")
         sim.schedule_event(0, EventType.AUV_DECISION_READY, auv.auv_id)
 
@@ -63,8 +70,9 @@ def main() -> None:
                 ch_id = targets[auv_id].popleft()
                 leg = sim.visit(auv_id, ch_id)
                 print(f"{prefix} Visit({ch_id}): {leg.distance_m:.2f} m, ETA={entry.time_s + leg.travel_time_s:.2f} s")
-            else:
+            elif auv_id not in returned:
                 leg = sim.return_to_sink(auv_id)
+                returned.add(auv_id)
                 print(f"{prefix} Return: {leg.distance_m:.2f} m, ETA={entry.time_s + leg.travel_time_s:.2f} s")
         elif entry.event_type is EventType.AUV_ARRIVAL_SINK:
             print(f"{prefix} arrived at Sink, {auv.status.name}, cargo={len(auv.cargo)} packets "
@@ -79,7 +87,11 @@ def main() -> None:
     carried = sum(len(auv.cargo) for auv in sim.auvs.values())
     dropped = sum(sim.generation_manager.get_stats(ch_id).overflow_dropped_packets
                   + sim.generation_manager.get_stats(ch_id).oversized_rejected_packets for ch_id in sim.cluster_heads)
-    print(f"Packet accounting: {generated} generated = {cached} cached + {carried} carried + {dropped} dropped")
+    assert sim.sink is not None
+    delivered = len(sim.sink.delivered_records)
+    assert generated == cached + carried + delivered + dropped
+    print(f"Packet accounting: {generated} generated = {cached} cached + {carried} carried "
+          f"+ {delivered} delivered + {dropped} dropped")
 
 
 if __name__ == "__main__":

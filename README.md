@@ -1,16 +1,16 @@
 # Prediction-Enhanced Asynchronous MAPPO UWSN
 
-面向多 AUV 水下传感器网络数据采集的 Python 研究项目。当前仿真覆盖 CH 生成、AUV 异步航行与采集，以及返航至 Sink。
+面向多 AUV 水下传感器网络数据采集的 Python 研究项目。当前仿真覆盖 CH 生成、AUV 异步航行与采集、返航及 Sink 包级交付。
 
 | 模块 | 已实现内容 |
 | --- | --- |
 | `uwsn/entities/` | 不可变数据包、CH FIFO 缓存与服务锁、AUV 存储、Sink 单通道 FCFS 上传及包级 VoI |
 | `uwsn/data_generation/` | 固定与分段常数速率 Poisson、两状态 MMPP、生成事件与缓存统计 |
-| `uwsn/environment/` | 事件队列、Simulator、CH 报告、异步 AUV 决策就绪和 S1–S3 场景构造 |
+| `uwsn/environment/` | 事件队列、Simulator、CH 报告、异步 AUV 决策就绪、Sink 排队与交付事件、S1–S3 场景构造 |
 | `uwsn/navigation/` | 三维直线航行和 CH 通信范围的最近进入点 |
 | `tests/` | 实体、随机过程、事件时序、可复现性和包守恒测试 |
 
-AUV 携带已采集数据抵达 Sink 后进入 `WAITING_SINK`。上传事件接入、预测模块和异步 MAPPO 属于后续开发阶段。
+AUV 携带数据抵达 Sink 后以实际到达顺序等待单通道 FCFS 服务。同刻到达按事件序号排队。每个包完成上传时才从 cargo 移除并写入交付账本。全部上传完成后，AUV 在任务剩余时间内重新进入决策就绪状态。
 
 ## Python 与依赖
 
@@ -45,6 +45,7 @@ python scripts/run_generation_demo.py
 python scripts/run_mmpp_demo.py
 python scripts/run_event_demo.py
 python scripts/run_auv_collection_demo.py
+python scripts/run_sink_delivery_demo.py
 ```
 
 也可以使用模块入口。
@@ -58,6 +59,8 @@ Poisson 生成演示在 `[0, 120)` 秒内生成 3 个 CH 的数据，包含固�
 
 每个 CH 使用自己的 `random.Random(seed)`。在相同运行环境中，相同参数和种子产生相同事件序列。
 跨速率区间时保留剩余累计强度，时间段之间的空隙按零速率处理。
+
+Sink 交付演示沿用 75 秒采集场景，以 100 B/s 的上传速率产生排队。输出每个 AUV 的等待时间、包级交付时间、累计 VoI 和任务结束时的包守恒检查。
 
 ## 复现场景和训练回合
 
@@ -83,6 +86,7 @@ sim = make_scenario("S2", master_seed=41, record_log=False)
 
 - 时间单位为秒，位置单位为米，数据大小单位为 bytes，生成速率单位为 packets/s。
 - 等长包在 Sink 完成上传时兑现 VoI。`Sink.volume_weight` 默认是 0.3，时效项权重为 `1 - volume_weight`。超过任务截止时间的交付价值为零。
+- 恰好在截止时刻完成的上传包计入交付和 VoI。未完成的包留在 AUV cargo，Sink 的 `interrupted_uploads` 保留这些请求的诊断记录。队列、交付账本和中断记录属于仿真内部信息。
 - 数据生成采用左闭右开时间区间，每个 CH 的包大小、基础价值和衰减系数由 `PacketParameters` 设置。
 - 生成速率由 Poisson 的 `RateSchedule` 或 `MMPPConfig` 定义。每个 MMPP CH 必须显式配置不同的 `random_seed`。
 - CH 默认采用 `DROP_NEWEST`，缓存满时优先保留已有包。对比实验可显式使用 `DROP_OLDEST`。

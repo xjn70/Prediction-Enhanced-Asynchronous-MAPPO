@@ -4,7 +4,7 @@ from .auv import AUV
 from .cluster_head import BufferInsertResult, CHReport, ClusterHead
 from .common import AUVStatus, OverflowPolicy, Position3D
 from .data_packet import DataPacket
-from .sink import DeliveryRecord, PacketCompletion, Sink, UploadJob, UploadRequest
+from .sink import DeliveryRecord, InterruptedUpload, PacketCompletion, Sink, UploadJob, UploadRequest
 
 __all__ = [
     "AUV",
@@ -14,6 +14,7 @@ __all__ = [
     "ClusterHead",
     "DataPacket",
     "DeliveryRecord",
+    "InterruptedUpload",
     "OverflowPolicy",
     "PacketCompletion",
     "Position3D",

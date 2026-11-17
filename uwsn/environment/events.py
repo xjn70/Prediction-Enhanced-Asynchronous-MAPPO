@@ -15,6 +15,7 @@ class EventType(str, Enum):
     COLLECTION_COMPLETE = "collection_complete"
     AUV_ARRIVAL_SINK = "auv_arrival_sink"
     UPLOAD_START = "upload_start"
+    PACKET_UPLOAD_COMPLETE = "packet_upload_complete"
     UPLOAD_COMPLETE = "upload_complete"
     WAIT_COMPLETE = "wait_complete"
     MISSION_END = "mission_end"
